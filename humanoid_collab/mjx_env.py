@@ -691,6 +691,81 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
 
             return next_state, obs_pair, reward, terminated, truncated, hold_steps, reason_code, contact_flags
 
+        def step_fast_kernel(state, action_h0, action_h1):
+            """Fast transition kernel without observation/materialization outputs."""
+            action_h0 = jnp.clip(action_h0, -1.0, 1.0)
+            action_h1 = jnp.clip(action_h1, -1.0, 1.0)
+
+            ctrl = jnp.zeros((mjx_model.nu,), dtype=jnp.float32)
+            ctrl = ctrl.at[h0_act_idx].set(action_h0[:action_dim])
+            ctrl = ctrl.at[h1_act_idx].set(action_h1[:action_dim])
+
+            data = state.data.replace(ctrl=ctrl)
+
+            def body(_, d):
+                return mjx.step(mjx_model, d)
+
+            data = jax.lax.fori_loop(0, frame_skip, body, data)
+
+            contact_flags, force_proxy = compute_contacts(data)
+            success_condition, reward_no_term = task_success_and_reward(
+                data, contact_flags, ctrl, force_proxy, state.hold_steps, state.weights
+            )
+            hold_steps = jnp.where(success_condition, state.hold_steps + 1, jnp.int32(0))
+            success = hold_steps >= hold_target
+
+            fallen, _ = check_fallen(data)
+            step_count = state.step_count + 1
+            terminated = success | fallen
+            truncated = step_count >= horizon
+
+            reward = reward_no_term
+            reward = reward + jnp.where(fallen, state.weights[7], 0.0)
+            reward = reward + jnp.where(success, state.weights[8], 0.0)
+
+            nan_flag = jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
+            reward = jnp.where(nan_flag, jnp.asarray(-100.0, dtype=jnp.float32), reward)
+            terminated = terminated | nan_flag
+
+            next_state = _MJXState(
+                data=data,
+                step_count=step_count,
+                hold_steps=hold_steps,
+                terminated=terminated,
+                truncated=truncated,
+                weights=state.weights,
+            )
+
+            return next_state, reward, terminated, truncated
+
+        def rollout_kernel(state, actions_h0, actions_h1):
+            """Scan many transitions with no host sync and no per-step payloads."""
+
+            def body_fn(carry, xs):
+                a0_t, a1_t = xs
+                next_state, _, _, _ = step_fast_kernel(carry, a0_t, a1_t)
+                return next_state, ()
+
+            final_state, _ = jax.lax.scan(body_fn, state, (actions_h0, actions_h1))
+            return final_state
+
+        v_step_fast_kernel = jax.vmap(
+            step_fast_kernel, in_axes=(0, 0, 0), out_axes=(0, 0, 0, 0)
+        )
+
+        def rollout_batched_kernel(state_batched, actions_h0_batched, actions_h1_batched):
+            """Scan many transitions over many envs: actions shape [B, T, A]."""
+            actions_h0_tba = jnp.swapaxes(actions_h0_batched, 0, 1)
+            actions_h1_tba = jnp.swapaxes(actions_h1_batched, 0, 1)
+
+            def body_fn(carry, xs):
+                a0_t, a1_t = xs  # [B, A]
+                next_state, _, _, _ = v_step_fast_kernel(carry, a0_t, a1_t)
+                return next_state, ()
+
+            final_state, _ = jax.lax.scan(body_fn, state_batched, (actions_h0_tba, actions_h1_tba))
+            return final_state
+
         def forward_kernel(data):
             return mjx.forward(mjx_model, data)
 
@@ -698,10 +773,14 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
             self._mjx_forward_kernel = jax.jit(forward_kernel)
             self._observe_kernel = jax.jit(observe_kernel)
             self._step_kernel = jax.jit(step_kernel)
+            self._rollout_kernel = jax.jit(rollout_kernel)
+            self._rollout_batched_kernel = jax.jit(rollout_batched_kernel)
         else:
             self._mjx_forward_kernel = forward_kernel
             self._observe_kernel = observe_kernel
             self._step_kernel = step_kernel
+            self._rollout_kernel = rollout_kernel
+            self._rollout_batched_kernel = rollout_batched_kernel
 
     def reset(
         self,
@@ -741,6 +820,98 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
             self._mjx_state, action_h0, action_h1
         )
         return obs_pair, reward, terminated, truncated, hold_steps, reason_code, contact_flags
+
+    def get_jax_state(self):
+        """Return current internal JAX state."""
+        if self._mjx_state is None:
+            raise RuntimeError("Environment not initialized. Call reset first.")
+        return self._mjx_state
+
+    def set_jax_state(self, state, sync_python: bool = False) -> None:
+        """Replace internal JAX state."""
+        self._mjx_state = state
+        if sync_python:
+            step_count_np, hold_steps_np, terminated_np, truncated_np = self._jax.device_get(
+                (
+                    state.step_count,
+                    state.hold_steps,
+                    state.terminated,
+                    state.truncated,
+                )
+            )
+            self._step_count = int(step_count_np)
+            self._hold_steps = int(hold_steps_np)
+            self._terminated = bool(terminated_np)
+            self._truncated = bool(truncated_np)
+            self.agents = [] if (self._terminated or self._truncated) else self.possible_agents.copy()
+
+    def make_batched_state(self, batch_size: int, state=None):
+        """Broadcast a single state to a batched state PyTree."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        base_state = self.get_jax_state() if state is None else state
+
+        def _tile(x):
+            if hasattr(x, "shape"):
+                return self._jnp.broadcast_to(x, (batch_size,) + x.shape)
+            return x
+
+        return self._jax.tree_util.tree_map(_tile, base_state)
+
+    def rollout_jax(self, actions_h0, actions_h1, state=None, commit: bool = False):
+        """Run a compiled on-device rollout.
+
+        Args:
+            actions_h0: JAX/NumPy array [T, action_dim] for agent h0.
+            actions_h1: JAX/NumPy array [T, action_dim] for agent h1.
+            state: Optional starting JAX state. Defaults to current env state.
+            commit: If True, write final state back into this env.
+        Returns:
+            Final JAX state after all rollout steps.
+        """
+        if state is None:
+            state = self.get_jax_state()
+
+        a0 = self._jnp.asarray(actions_h0, dtype=self._jnp.float32)
+        a1 = self._jnp.asarray(actions_h1, dtype=self._jnp.float32)
+
+        if a0.ndim != 2 or a1.ndim != 2:
+            raise ValueError("actions_h0/actions_h1 must have shape [T, action_dim]")
+        if a0.shape != a1.shape:
+            raise ValueError(f"Action shapes must match, got {a0.shape} vs {a1.shape}")
+        if a0.shape[1] != self._action_dim:
+            raise ValueError(f"Expected action_dim={self._action_dim}, got {a0.shape[1]}")
+
+        final_state = self._rollout_kernel(state, a0, a1)
+        if commit:
+            self.set_jax_state(final_state, sync_python=True)
+        return final_state
+
+    def rollout_jax_batched(self, actions_h0, actions_h1, state_batched=None):
+        """Run compiled on-device rollout over batched environments.
+
+        Args:
+            actions_h0: Array [B, T, action_dim]
+            actions_h1: Array [B, T, action_dim]
+            state_batched: Optional batched state. If None, tiles current state across B.
+        Returns:
+            Final batched JAX state.
+        """
+        a0 = self._jnp.asarray(actions_h0, dtype=self._jnp.float32)
+        a1 = self._jnp.asarray(actions_h1, dtype=self._jnp.float32)
+
+        if a0.ndim != 3 or a1.ndim != 3:
+            raise ValueError("actions_h0/actions_h1 must have shape [B, T, action_dim]")
+        if a0.shape != a1.shape:
+            raise ValueError(f"Action shapes must match, got {a0.shape} vs {a1.shape}")
+        if a0.shape[2] != self._action_dim:
+            raise ValueError(f"Expected action_dim={self._action_dim}, got {a0.shape[2]}")
+
+        batch_size = int(a0.shape[0])
+        if state_batched is None:
+            state_batched = self.make_batched_state(batch_size=batch_size)
+
+        return self._rollout_batched_kernel(state_batched, a0, a1)
 
     def step(
         self,
@@ -851,4 +1022,3 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
             return super().state()
         qpos, qvel = self._jax.device_get((self._mjx_state.data.qpos, self._mjx_state.data.qvel))
         return np.concatenate([np.asarray(qpos), np.asarray(qvel)])
-

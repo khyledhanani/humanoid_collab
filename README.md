@@ -84,6 +84,8 @@ python scripts/rollout_random.py --task hug --backend cpu
 python scripts/rollout_random.py --task hug --backend mjx
 python scripts/render_demo.py --task handshake --backend mjx --mode video
 python scripts/benchmark_backends.py --task hug --backend both --horizons 100 1000 10000 --repeats 3
+python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan --horizons 1000 10000
+python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --batch-size 128 --horizons 1000 10000
 ```
 
 `MJXHumanoidCollabEnv` runs step logic fully on-device (MJX physics + JAX obs/reward/success/contact proxy). CPU sync is only used for rendering and `state()`.
