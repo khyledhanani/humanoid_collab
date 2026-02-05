@@ -1,0 +1,204 @@
+"""Benchmark CPU vs MJX backend speed and estimate JIT break-even length."""
+
+from __future__ import annotations
+
+import argparse
+import statistics
+import time
+from typing import Dict, List, Optional, Type
+
+import numpy as np
+
+from humanoid_collab import HumanoidCollabEnv
+
+try:
+    from humanoid_collab import MJXHumanoidCollabEnv
+except Exception:
+    MJXHumanoidCollabEnv = None  # type: ignore[assignment]
+
+
+EnvType = Type[HumanoidCollabEnv]
+
+
+def _run_steps(
+    env: HumanoidCollabEnv,
+    steps: int,
+    rng: np.random.RandomState,
+    act_dim: int,
+    seed_base: int,
+) -> float:
+    """Run fixed number of env steps and return elapsed seconds."""
+    t0 = time.perf_counter()
+    for i in range(steps):
+        if not env.agents:
+            env.reset(seed=seed_base + i + 1)
+        action_h0 = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+        action_h1 = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+        env.step({"h0": action_h0, "h1": action_h1})
+    return time.perf_counter() - t0
+
+
+def _benchmark_backend(
+    env_cls: EnvType,
+    backend_name: str,
+    task: str,
+    frame_skip: int,
+    horizons: List[int],
+    repeats: int,
+    warmup_steps: int,
+    seed: int,
+) -> Dict[str, object]:
+    """Benchmark one backend over horizons and repeats."""
+    env = env_cls(task=task, horizon=max(horizons) + warmup_steps + 1000, frame_skip=frame_skip)
+    env.reset(seed=seed)
+    act_dim = int(env.action_space("h0").shape[0])
+
+    compile_s: Optional[float] = None
+    if backend_name == "mjx":
+        rng = np.random.RandomState(seed)
+        compile_s = _run_steps(env, 1, rng, act_dim, seed + 100_000)
+        if warmup_steps > 0:
+            _run_steps(env, warmup_steps, rng, act_dim, seed + 110_000)
+
+    horizon_times: Dict[int, List[float]] = {h: [] for h in horizons}
+    for repeat in range(repeats):
+        rng = np.random.RandomState(seed + repeat + 1)
+        for horizon in horizons:
+            env.reset(seed=seed + repeat + horizon)
+            dt = _run_steps(env, horizon, rng, act_dim, seed + repeat + horizon * 10)
+            horizon_times[horizon].append(dt)
+
+    env.close()
+
+    horizon_summary = {}
+    for horizon, dts in horizon_times.items():
+        mean_s = statistics.fmean(dts)
+        stdev_s = statistics.pstdev(dts) if len(dts) > 1 else 0.0
+        horizon_summary[horizon] = {
+            "mean_s": mean_s,
+            "stdev_s": stdev_s,
+            "steps_per_s": horizon / mean_s if mean_s > 0 else 0.0,
+        }
+
+    return {
+        "backend": backend_name,
+        "compile_s": compile_s,
+        "horizons": horizon_summary,
+    }
+
+
+def _estimate_break_even(
+    cpu_results: Dict[str, object],
+    mjx_results: Dict[str, object],
+) -> Optional[float]:
+    """Estimate steps needed for MJX to amortize compile overhead."""
+    compile_s = mjx_results.get("compile_s")
+    if compile_s is None:
+        return None
+
+    cpu_horizons: Dict[int, Dict[str, float]] = cpu_results["horizons"]  # type: ignore[assignment]
+    mjx_horizons: Dict[int, Dict[str, float]] = mjx_results["horizons"]  # type: ignore[assignment]
+    common_h = sorted(set(cpu_horizons.keys()) & set(mjx_horizons.keys()))
+    if not common_h:
+        return None
+
+    # Use largest shared horizon to reduce noise in per-step estimate.
+    h = common_h[-1]
+    cpu_step_s = cpu_horizons[h]["mean_s"] / h
+    mjx_step_s = mjx_horizons[h]["mean_s"] / h
+    delta = cpu_step_s - mjx_step_s
+    if delta <= 0:
+        return None
+
+    return float(compile_s / delta)
+
+
+def _print_results(results: Dict[str, object]) -> None:
+    backend = str(results["backend"])
+    compile_s = results.get("compile_s")
+    horizons: Dict[int, Dict[str, float]] = results["horizons"]  # type: ignore[assignment]
+
+    print(f"\n[{backend.upper()}]")
+    if compile_s is not None:
+        print(f"compile+first_step: {compile_s:.4f}s")
+    for h in sorted(horizons.keys()):
+        row = horizons[h]
+        print(
+            f"steps={h:>6d} | mean={row['mean_s']:.4f}s "
+            f"| std={row['stdev_s']:.4f}s | throughput={row['steps_per_s']:.1f} steps/s"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Benchmark HumanoidCollab CPU vs MJX backend.")
+    parser.add_argument("--task", type=str, default="hug", choices=["hug", "handshake", "box_lift"])
+    parser.add_argument("--frame-skip", type=int, default=5)
+    parser.add_argument("--horizons", type=int, nargs="+", default=[100, 1000, 10000])
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="both",
+        choices=["cpu", "mjx", "both"],
+        help="Which backend(s) to benchmark.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    horizons = sorted(set(args.horizons))
+
+    run_cpu = args.backend in {"cpu", "both"}
+    run_mjx = args.backend in {"mjx", "both"}
+
+    cpu_results = None
+    mjx_results = None
+
+    if run_cpu:
+        cpu_results = _benchmark_backend(
+            env_cls=HumanoidCollabEnv,
+            backend_name="cpu",
+            task=args.task,
+            frame_skip=args.frame_skip,
+            horizons=horizons,
+            repeats=args.repeats,
+            warmup_steps=0,
+            seed=args.seed,
+        )
+        _print_results(cpu_results)
+
+    if run_mjx:
+        if MJXHumanoidCollabEnv is None:
+            raise RuntimeError(
+                "MJX backend is unavailable. Install with: pip install -e '.[mjx]'"
+            )
+        try:
+            mjx_results = _benchmark_backend(
+                env_cls=MJXHumanoidCollabEnv,
+                backend_name="mjx",
+                task=args.task,
+                frame_skip=args.frame_skip,
+                horizons=horizons,
+                repeats=args.repeats,
+                warmup_steps=args.warmup_steps,
+                seed=args.seed,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                f"MJX backend is unavailable: {exc}. Install with: pip install -e '.[mjx]'"
+            ) from exc
+        _print_results(mjx_results)
+
+    if cpu_results is not None and mjx_results is not None:
+        break_even = _estimate_break_even(cpu_results, mjx_results)
+        if break_even is None:
+            print("\nBreak-even estimate: not reached (MJX per-step is not faster on this setup).")
+        else:
+            print(f"\nEstimated break-even: ~{break_even:.0f} steps")
+
+
+if __name__ == "__main__":
+    main()

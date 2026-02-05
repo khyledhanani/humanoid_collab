@@ -1,0 +1,376 @@
+"""PettingZoo Parallel environment for two-agent humanoid collaboration."""
+
+from typing import Dict, Any, Optional, Tuple
+import functools
+
+import numpy as np
+import mujoco
+import mujoco.viewer
+import gymnasium as gym
+from gymnasium import spaces
+from pettingzoo import ParallelEnv
+
+from humanoid_collab.mjcf_builder import build_mjcf
+from humanoid_collab.tasks.registry import get_task
+from humanoid_collab.utils.ids import IDCache
+from humanoid_collab.utils.contacts import ContactDetector
+from humanoid_collab.utils.obs import ObservationBuilder
+
+
+class HumanoidCollabEnv(ParallelEnv):
+    """Two-agent humanoid collaboration environment.
+
+    A PettingZoo ParallelEnv where two humanoid agents collaborate on
+    configurable tasks (hug, handshake, box_lift, etc.).
+
+    Args:
+        task: Task name (e.g., 'hug', 'handshake', 'box_lift')
+        render_mode: 'human' or 'rgb_array'
+        horizon: Maximum episode length in steps
+        frame_skip: Number of physics steps per action
+        hold_target: Consecutive success-condition steps for completion
+        stage: Curriculum stage
+    """
+
+    metadata = {
+        "render_modes": ["human", "rgb_array"],
+        "name": "humanoid_collab_v0",
+        "is_parallelizable": True,
+    }
+
+    def __init__(
+        self,
+        task: str = "hug",
+        render_mode: Optional[str] = None,
+        horizon: int = 1000,
+        frame_skip: int = 5,
+        hold_target: int = 30,
+        stage: int = 0,
+    ):
+        super().__init__()
+
+        self.task_name = task
+        self.render_mode = render_mode
+        self.horizon = horizon
+        self.frame_skip = frame_skip
+        self.hold_target = hold_target
+        self.stage = stage
+
+        # Get task configuration
+        self.task_config = get_task(task)
+        self.task_config.set_stage(stage)
+
+        # Build MJCF with task additions
+        xml_str = build_mjcf(
+            task_worldbody_additions=self.task_config.mjcf_worldbody_additions(),
+            task_actuator_additions=self.task_config.mjcf_actuator_additions(),
+        )
+
+        # Compile MuJoCo model
+        self.model = mujoco.MjModel.from_xml_string(xml_str)
+        self.data = mujoco.MjData(self.model)
+
+        # Initialize ID cache with standard humanoid groups
+        self.id_cache = IDCache(self.model)
+
+        # Register task-specific geom groups
+        self.task_config.register_geom_groups(self.model, self.id_cache)
+
+        # Initialize contact detector with task-configured pairs
+        self.contact_detector = ContactDetector(
+            self.id_cache,
+            self.task_config.get_contact_pairs(),
+        )
+
+        # Initialize observation builder
+        self.obs_builder = ObservationBuilder(
+            self.id_cache,
+            self.model,
+            task_obs_dim=self.task_config.task_obs_dim,
+        )
+
+        # Agent setup
+        self.agents = ["h0", "h1"]
+        self.possible_agents = self.agents.copy()
+
+        # Dimensions
+        self._action_dim = self.id_cache.get_num_actuators("h0")
+        self._obs_dim = self.obs_builder.get_obs_dim()
+
+        # Episode state
+        self._step_count = 0
+        self._hold_steps = 0
+        self._terminated = False
+        self._truncated = False
+        self._rng = np.random.RandomState()
+
+        # Rendering
+        self._viewer = None
+        self._render_context = None
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent: str) -> spaces.Space:
+        return spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self._obs_dim,),
+            dtype=np.float32,
+        )
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent: str) -> spaces.Space:
+        return spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(self._action_dim,),
+            dtype=np.float32,
+        )
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]]]:
+        if seed is not None:
+            self._rng = np.random.RandomState(seed)
+
+        # Handle options
+        if options is not None:
+            if "stage" in options:
+                self.stage = options["stage"]
+                self.task_config.set_stage(self.stage)
+
+        # Reset MuJoCo state
+        mujoco.mj_resetData(self.model, self.data)
+
+        # Task-specific initial state randomization
+        self.task_config.randomize_state(self.model, self.data, self.id_cache, self._rng)
+
+        # Forward to compute derived quantities
+        mujoco.mj_forward(self.model, self.data)
+
+        # Settle physics for tasks with free objects (e.g., box_lift)
+        # so objects come to rest before the episode starts
+        if self.task_config.mjcf_worldbody_additions():
+            self.data.ctrl[:] = 0.0
+            for _ in range(50):
+                mujoco.mj_step(self.model, self.data)
+            # Zero all velocities after settling
+            self.data.qvel[:] = 0.0
+            mujoco.mj_forward(self.model, self.data)
+
+        # Reset episode state
+        self._step_count = 0
+        self._hold_steps = 0
+        self._terminated = False
+        self._truncated = False
+        self.agents = self.possible_agents.copy()
+
+        # Build observations
+        contact_info = self.contact_detector.detect_contacts(self.data)
+        observations = self._build_full_observations(contact_info)
+
+        infos = {
+            agent: {
+                "task": self.task_name,
+                "stage": self.stage,
+                "weights": self.task_config.get_weights_dict(),
+            }
+            for agent in self.agents
+        }
+
+        return observations, infos
+
+    def step(
+        self,
+        actions: Dict[str, np.ndarray],
+    ) -> Tuple[
+        Dict[str, np.ndarray],
+        Dict[str, float],
+        Dict[str, bool],
+        Dict[str, bool],
+        Dict[str, Dict[str, Any]],
+    ]:
+        if self._terminated or self._truncated:
+            return self._get_terminal_returns()
+
+        # Pack actions into control vector
+        ctrl = np.zeros(self.model.nu)
+        for agent in self.agents:
+            if agent in actions:
+                action = np.clip(actions[agent], -1.0, 1.0)
+                idx = self.id_cache.actuator_idx[agent]
+                ctrl[idx] = action
+        self.data.ctrl[:] = ctrl
+
+        # Step physics
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
+
+        self._step_count += 1
+
+        # NaN check
+        if np.any(np.isnan(self.data.qpos)) or np.any(np.isnan(self.data.qvel)):
+            return self._handle_nan_error()
+
+        # Detect contacts
+        contact_info = self.contact_detector.detect_contacts(self.data)
+        contact_force_proxy = self.contact_detector.get_contact_force_proxy(self.data)
+
+        # Check success condition
+        success_condition, success_info = self.task_config.check_success(
+            self.data, self.id_cache, contact_info
+        )
+
+        if success_condition:
+            self._hold_steps += 1
+        else:
+            self._hold_steps = 0
+
+        success = self._hold_steps >= self.hold_target
+
+        # Check for fall
+        fallen, fallen_agent = self.task_config.check_fallen(self.data, self.id_cache)
+
+        # Compute reward
+        reward, reward_info = self.task_config.compute_reward(
+            self.data,
+            self.id_cache,
+            contact_info,
+            ctrl,
+            contact_force_proxy,
+            self._hold_steps,
+            success,
+            fallen,
+        )
+
+        # Determine termination/truncation
+        termination_reason = None
+        if success:
+            self._terminated = True
+            termination_reason = "success"
+        elif fallen:
+            self._terminated = True
+            termination_reason = f"fall_{fallen_agent}"
+        elif self._step_count >= self.horizon:
+            self._truncated = True
+            termination_reason = "horizon"
+
+        # Build observations
+        observations = self._build_full_observations(contact_info)
+
+        # Build rewards (cooperative: same for both)
+        rewards = {agent: reward for agent in self.agents}
+
+        terminations = {agent: self._terminated for agent in self.agents}
+        truncations = {agent: self._truncated for agent in self.agents}
+
+        infos = {}
+        for agent in self.agents:
+            infos[agent] = {
+                "step": self._step_count,
+                "hold_steps": self._hold_steps,
+                "termination_reason": termination_reason,
+                "task": self.task_name,
+                "stage": self.stage,
+                **reward_info,
+                **success_info,
+                **{k: v for k, v in contact_info.items()},
+            }
+
+        if self._terminated or self._truncated:
+            self.agents = []
+
+        return observations, rewards, terminations, truncations, infos
+
+    def _build_full_observations(self, contact_info: Dict[str, bool]) -> Dict[str, np.ndarray]:
+        """Build full observations = base obs + task-specific obs."""
+        base_obs = self.obs_builder.build_base_observations(self.data)
+
+        observations = {}
+        for agent in self.possible_agents:
+            task_obs = self.task_config.compute_task_obs(
+                self.data, self.id_cache, agent, contact_info
+            )
+            observations[agent] = np.concatenate([base_obs[agent], task_obs]).astype(np.float32)
+
+        return observations
+
+    def _get_terminal_returns(self):
+        return (
+            {agent: np.zeros(self._obs_dim, dtype=np.float32) for agent in self.possible_agents},
+            {agent: 0.0 for agent in self.possible_agents},
+            {agent: True for agent in self.possible_agents},
+            {agent: self._truncated for agent in self.possible_agents},
+            {agent: {} for agent in self.possible_agents},
+        )
+
+    def _handle_nan_error(self):
+        self._terminated = True
+        self.agents = []
+        return (
+            {agent: np.zeros(self._obs_dim, dtype=np.float32) for agent in self.possible_agents},
+            {agent: -100.0 for agent in self.possible_agents},
+            {agent: True for agent in self.possible_agents},
+            {agent: False for agent in self.possible_agents},
+            {agent: {"termination_reason": "nan_error"} for agent in self.possible_agents},
+        )
+
+    def render(self) -> Optional[np.ndarray]:
+        if self.render_mode is None:
+            return None
+        if self.render_mode == "human":
+            return self._render_human()
+        elif self.render_mode == "rgb_array":
+            return self._render_rgb_array()
+        return None
+
+    def _render_human(self) -> None:
+        if self._viewer is None:
+            try:
+                self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                self._viewer_is_passive = True
+            except Exception:
+                self._viewer_is_passive = False
+                try:
+                    if self._render_context is None:
+                        self._render_context = mujoco.Renderer(self.model, 480, 640)
+                    import warnings
+                    if not hasattr(self, '_viewer_warning_shown'):
+                        warnings.warn(
+                            "Passive viewer unavailable. On macOS, run with 'mjpython' "
+                            "instead of 'python3' for interactive rendering, "
+                            "or use --mode video to save a video file."
+                        )
+                        self._viewer_warning_shown = True
+                except Exception:
+                    pass
+
+        if self._viewer is not None and self._viewer_is_passive:
+            self._viewer.sync()
+
+    def _render_rgb_array(self) -> np.ndarray:
+        width, height = 640, 480
+        if self._render_context is None:
+            self._render_context = mujoco.Renderer(self.model, height, width)
+        self._render_context.update_scene(self.data, camera="h0_track")
+        return self._render_context.render()
+
+    def close(self) -> None:
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
+        if self._render_context is not None:
+            self._render_context.close()
+            self._render_context = None
+
+    def state(self) -> np.ndarray:
+        return np.concatenate([self.data.qpos.copy(), self.data.qvel.copy()])
+
+    @property
+    def max_num_agents(self) -> int:
+        return 2
+
+    @property
+    def num_agents(self) -> int:
+        return len(self.agents)
