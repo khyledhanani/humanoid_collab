@@ -30,6 +30,7 @@ class HumanoidCollabEnv(ParallelEnv):
         frame_skip: Number of physics steps per action
         hold_target: Consecutive success-condition steps for completion
         stage: Curriculum stage
+        physics_profile: MuJoCo physics profile ("default", "balanced", "train_fast")
     """
 
     metadata = {
@@ -46,6 +47,7 @@ class HumanoidCollabEnv(ParallelEnv):
         frame_skip: int = 5,
         hold_target: int = 30,
         stage: int = 0,
+        physics_profile: str = "default",
     ):
         super().__init__()
 
@@ -55,6 +57,7 @@ class HumanoidCollabEnv(ParallelEnv):
         self.frame_skip = frame_skip
         self.hold_target = hold_target
         self.stage = stage
+        self.physics_profile = physics_profile
 
         # Get task configuration
         self.task_config = get_task(task)
@@ -64,6 +67,7 @@ class HumanoidCollabEnv(ParallelEnv):
         xml_str = build_mjcf(
             task_worldbody_additions=self.task_config.mjcf_worldbody_additions(),
             task_actuator_additions=self.task_config.mjcf_actuator_additions(),
+            physics_profile=self.physics_profile,
         )
 
         # Compile MuJoCo model
@@ -174,6 +178,7 @@ class HumanoidCollabEnv(ParallelEnv):
             agent: {
                 "task": self.task_name,
                 "stage": self.stage,
+                "physics_profile": self.physics_profile,
                 "weights": self.task_config.get_weights_dict(),
             }
             for agent in self.agents
@@ -273,6 +278,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 "termination_reason": termination_reason,
                 "task": self.task_name,
                 "stage": self.stage,
+                "physics_profile": self.physics_profile,
                 **reward_info,
                 **success_info,
                 **{k: v for k, v in contact_info.items()},

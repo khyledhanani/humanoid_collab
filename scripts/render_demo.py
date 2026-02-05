@@ -3,25 +3,45 @@
 import argparse
 
 from humanoid_collab.env import HumanoidCollabEnv
+from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.mjx_env import MJXHumanoidCollabEnv
 from humanoid_collab.tasks.registry import available_tasks
 
 
-def _make_env(task: str, stage: int, backend: str, render_mode: str):
+def _make_env(task: str, stage: int, backend: str, render_mode: str, physics_profile: str):
     if backend == "mjx":
-        return MJXHumanoidCollabEnv(task=task, render_mode=render_mode, stage=stage)
-    return HumanoidCollabEnv(task=task, render_mode=render_mode, stage=stage)
+        return MJXHumanoidCollabEnv(
+            task=task,
+            render_mode=render_mode,
+            stage=stage,
+            physics_profile=physics_profile,
+        )
+    return HumanoidCollabEnv(
+        task=task,
+        render_mode=render_mode,
+        stage=stage,
+        physics_profile=physics_profile,
+    )
 
 
-def render_human(task: str, stage: int = 0, max_steps: int = 500, backend: str = "cpu"):
+def render_human(
+    task: str,
+    stage: int = 0,
+    max_steps: int = 500,
+    backend: str = "cpu",
+    physics_profile: str = "default",
+):
     """Render with interactive viewer (requires mjpython on macOS).
 
     Auto-resets on episode termination so you can watch continuously.
     """
-    env = _make_env(task, stage, backend, "human")
+    env = _make_env(task, stage, backend, "human", physics_profile)
     obs, infos = env.reset(seed=42)
 
-    print(f"Rendering task '{task}' (stage {stage}, backend={backend}). Close the viewer to stop.")
+    print(
+        f"Rendering task '{task}' (stage {stage}, backend={backend}, "
+        f"physics_profile={physics_profile}). Close the viewer to stop."
+    )
     print(f"Auto-resets on fall/termination. Will run for {max_steps} total steps.")
 
     step = 0
@@ -45,6 +65,7 @@ def render_video(
     max_steps: int = 300,
     output: str = "demo.mp4",
     backend: str = "cpu",
+    physics_profile: str = "default",
 ):
     """Save a video of the demo."""
     try:
@@ -53,7 +74,7 @@ def render_video(
         print("imageio required for video mode: pip install imageio imageio-ffmpeg")
         return
 
-    env = _make_env(task, stage, backend, "rgb_array")
+    env = _make_env(task, stage, backend, "rgb_array", physics_profile)
     obs, infos = env.reset(seed=42)
 
     frames = []
@@ -87,6 +108,13 @@ def main():
     parser.add_argument("--backend", type=str, default="cpu",
                         choices=["cpu", "mjx"],
                         help="Physics backend")
+    parser.add_argument(
+        "--physics-profile",
+        type=str,
+        default="default",
+        choices=available_physics_profiles(),
+        help="MuJoCo physics profile.",
+    )
     parser.add_argument("--mode", type=str, default="video",
                         choices=["human", "video"],
                         help="Rendering mode")
@@ -96,9 +124,22 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "human":
-        render_human(args.task, args.stage, args.steps, args.backend)
+        render_human(
+            args.task,
+            args.stage,
+            args.steps,
+            args.backend,
+            args.physics_profile,
+        )
     else:
-        render_video(args.task, args.stage, args.steps, args.output, args.backend)
+        render_video(
+            args.task,
+            args.stage,
+            args.steps,
+            args.output,
+            args.backend,
+            args.physics_profile,
+        )
 
 
 if __name__ == "__main__":

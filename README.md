@@ -82,13 +82,17 @@ mjx_env.close()
 ```bash
 python scripts/rollout_random.py --task hug --backend cpu
 python scripts/rollout_random.py --task hug --backend mjx
+python scripts/rollout_random.py --task hug --backend mjx --physics-profile train_fast
 python scripts/render_demo.py --task handshake --backend mjx --mode video
 python scripts/benchmark_backends.py --task hug --backend both --horizons 100 1000 10000 --repeats 3
-python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan --horizons 1000 10000
-python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --batch-size 128 --horizons 1000 10000
+python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan --mjx-physics-profile train_fast --horizons 1000 10000
+python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-size 256 --horizons 1000 10000
+python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-sweep 64 128 256 512 --horizons 10000 --repeats 3
 ```
 
 `MJXHumanoidCollabEnv` runs step logic fully on-device (MJX physics + JAX obs/reward/success/contact proxy). CPU sync is only used for rendering and `state()`.
+
+Available physics profiles: `default`, `balanced`, `train_fast`.
 
 ## Environment API
 
@@ -110,6 +114,7 @@ HumanoidCollabEnv(
     frame_skip=5,        # Physics steps per action
     hold_target=30,      # Success hold duration
     stage=0,             # Curriculum stage
+    physics_profile="default",
 )
 ```
 

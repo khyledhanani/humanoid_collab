@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 
 from humanoid_collab.env import HumanoidCollabEnv
+from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.mjx_env import MJXHumanoidCollabEnv
 from humanoid_collab.tasks.registry import available_tasks
 
@@ -14,15 +15,27 @@ def run_rollout(
     stage: int = 0,
     seed: int = 42,
     backend: str = "cpu",
+    physics_profile: str = "default",
 ):
     if backend == "mjx":
-        env = MJXHumanoidCollabEnv(task=task, horizon=1000, stage=stage)
+        env = MJXHumanoidCollabEnv(
+            task=task,
+            horizon=1000,
+            stage=stage,
+            physics_profile=physics_profile,
+        )
     else:
-        env = HumanoidCollabEnv(task=task, horizon=1000, stage=stage)
+        env = HumanoidCollabEnv(
+            task=task,
+            horizon=1000,
+            stage=stage,
+            physics_profile=physics_profile,
+        )
 
     print(f"Task: {task}")
     print(f"Stage: {stage}")
     print(f"Backend: {backend}")
+    print(f"Physics profile: {physics_profile}")
     print(f"Obs dim: {env.observation_space('h0').shape}")
     print(f"Act dim: {env.action_space('h0').shape}")
     print(f"Running {num_episodes} episodes with random actions...\n")
@@ -87,12 +100,26 @@ def main():
     parser.add_argument("--backend", type=str, default="cpu",
                         choices=["cpu", "mjx"],
                         help="Physics backend")
+    parser.add_argument(
+        "--physics-profile",
+        type=str,
+        default="default",
+        choices=available_physics_profiles(),
+        help="MuJoCo physics profile.",
+    )
     parser.add_argument("--episodes", type=int, default=3, help="Number of episodes")
     parser.add_argument("--stage", type=int, default=0, help="Curriculum stage")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    run_rollout(args.task, args.episodes, args.stage, args.seed, args.backend)
+    run_rollout(
+        args.task,
+        args.episodes,
+        args.stage,
+        args.seed,
+        args.backend,
+        args.physics_profile,
+    )
 
 
 if __name__ == "__main__":

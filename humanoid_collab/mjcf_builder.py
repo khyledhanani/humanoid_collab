@@ -1,5 +1,43 @@
 """Programmatic MJCF XML generation for the humanoid collaboration environment."""
 
+from typing import Dict
+
+
+_PHYSICS_PROFILES: Dict[str, Dict[str, str]] = {
+    # Highest-fidelity baseline used by the original environment.
+    "default": {
+        "timestep": "0.005",
+        "iterations": "50",
+        "tolerance": "1e-10",
+        "solver": "Newton",
+        "jacobian": "dense",
+        "cone": "pyramidal",
+    },
+    # Moderate speed/fidelity trade-off.
+    "balanced": {
+        "timestep": "0.005",
+        "iterations": "20",
+        "tolerance": "1e-7",
+        "solver": "CG",
+        "jacobian": "sparse",
+        "cone": "pyramidal",
+    },
+    # Training speed profile for batched MJX rollouts.
+    "train_fast": {
+        "timestep": "0.005",
+        "iterations": "12",
+        "tolerance": "1e-6",
+        "solver": "CG",
+        "jacobian": "sparse",
+        "cone": "pyramidal",
+    },
+}
+
+
+def available_physics_profiles():
+    """Return supported physics profile names."""
+    return sorted(_PHYSICS_PROFILES.keys())
+
 
 def _humanoid_body(prefix: str, pos: str, material: str) -> str:
     """Generate the XML for one humanoid body.
@@ -136,16 +174,29 @@ def _humanoid_actuators(prefix: str) -> str:
     <motor name="{prefix}_right_elbow" joint="{prefix}_right_elbow" gear="25" ctrlrange="-1 1"/>"""
 
 
-def build_mjcf(task_worldbody_additions: str = "", task_actuator_additions: str = "") -> str:
+def build_mjcf(
+    task_worldbody_additions: str = "",
+    task_actuator_additions: str = "",
+    physics_profile: str = "default",
+) -> str:
     """Build the complete MJCF XML with two humanoids and optional task-specific additions.
 
     Args:
         task_worldbody_additions: XML fragment to inject into <worldbody> (e.g., a box body).
         task_actuator_additions: XML fragment to inject into <actuator> (e.g., extra actuators).
+        physics_profile: Physics option profile name.
 
     Returns:
         Complete MJCF XML string.
     """
+    if physics_profile not in _PHYSICS_PROFILES:
+        valid = ", ".join(available_physics_profiles())
+        raise ValueError(
+            f"Unknown physics profile '{physics_profile}'. Available: {valid}"
+        )
+
+    physics = _PHYSICS_PROFILES[physics_profile]
+
     h0_body = _humanoid_body("h0", "-1.0 0 1.4", "h0_mat")
     h1_body = _humanoid_body("h1", "1.0 0 1.4", "h1_mat")
     h0_actuators = _humanoid_actuators("h0")
@@ -153,7 +204,7 @@ def build_mjcf(task_worldbody_additions: str = "", task_actuator_additions: str 
 
     xml = f"""<mujoco model="humanoid_collab">
   <compiler angle="degree" inertiafromgeom="true"/>
-  <option timestep="0.005" iterations="50" tolerance="1e-10" solver="Newton" jacobian="dense" cone="pyramidal"/>
+  <option timestep="{physics['timestep']}" iterations="{physics['iterations']}" tolerance="{physics['tolerance']}" solver="{physics['solver']}" jacobian="{physics['jacobian']}" cone="{physics['cone']}"/>
 
   <size nstack="3000000" nuser_body="1"/>
 
