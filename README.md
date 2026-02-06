@@ -21,9 +21,6 @@ pip install -e ".[dev]"
 
 # With training dependencies:
 pip install -e ".[train]"
-
-# With MJX backend dependencies:
-pip install -e ".[mjx]"
 ```
 
 ## Dependencies
@@ -57,7 +54,6 @@ python scripts/render_demo.py --task hug --mode human
 
 ```python
 from humanoid_collab import HumanoidCollabEnv
-from humanoid_collab import MJXHumanoidCollabEnv
 
 env = HumanoidCollabEnv(task="hug", stage=0, horizon=1000)
 obs, infos = env.reset(seed=42)
@@ -67,53 +63,40 @@ while env.agents:
     obs, rewards, terminations, truncations, infos = env.step(actions)
 
 env.close()
-
-# MJX backend (physics stepped with MJX)
-mjx_env = MJXHumanoidCollabEnv(task="hug", stage=0, horizon=1000)
-obs, infos = mjx_env.reset(seed=42)
-while mjx_env.agents:
-    actions = {agent: mjx_env.action_space(agent).sample() for agent in mjx_env.agents}
-    obs, rewards, terminations, truncations, infos = mjx_env.step(actions)
-mjx_env.close()
 ```
 
-### Backend selection in scripts
+### Script examples
 
 ```bash
-python scripts/rollout_random.py --task hug --backend cpu
-python scripts/rollout_random.py --task hug --backend mjx
-python scripts/rollout_random.py --task hug --backend mjx --physics-profile train_fast
-python scripts/rollout_random.py --task handshake --backend cpu --fixed-standing --control-mode arms_only
-python scripts/render_demo.py --task handshake --backend mjx --mode video
-python scripts/benchmark_backends.py --task hug --backend both --horizons 100 1000 10000 --repeats 3
-python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan --mjx-physics-profile train_fast --horizons 1000 10000
-python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-size 256 --horizons 1000 10000
-python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-sweep 64 128 256 512 --horizons 10000 --repeats 3
-python scripts/benchmark_backends.py --task hug --backend cpu --cpu-mode subproc --cpu-num-envs 8 --cpu-physics-profile default --horizons 10000 --repeats 3
+python scripts/rollout_random.py --task handshake --fixed-standing --control-mode arms_only
+python scripts/render_demo.py --task handshake --mode video --fixed-standing --control-mode arms_only
+python scripts/benchmark_backends.py --task hug --mode both --horizons 100 1000 10000 --repeats 3
+python scripts/benchmark_backends.py --task hug --mode subproc --num-envs 8 --horizons 10000 --repeats 3
 python scripts/train_ippo.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --physics-profile default --total-steps 500000 --rollout-steps 1024 --ppo-epochs 8 --minibatch-size 256
+python scripts/render_ippo.py --checkpoint checkpoints/ippo_handshake_fixed_arms/ippo_update_000100.pt --episodes 3 --deterministic
 ```
-
-`MJXHumanoidCollabEnv` runs step logic fully on-device (MJX physics + JAX obs/reward/success/contact proxy). CPU sync is only used for rendering and `state()`.
 
 Available physics profiles: `default`, `balanced`, `train_fast`.
 Control modes: `all`, `arms_only`.
 
 CPU parallelization:
 - `SubprocHumanoidCollabVecEnv` in `humanoid_collab/vector_env.py` runs many CPU env instances in subprocesses.
-- Use `--cpu-mode subproc --cpu-num-envs N` in `scripts/benchmark_backends.py` to measure multi-env CPU throughput.
+- Use `--mode subproc --num-envs N` in `scripts/benchmark_backends.py` to measure multi-env CPU throughput.
 
 IPPO training:
 - `scripts/train_ippo.py` trains two independent PPO policies (`h0`, `h1`) on this environment.
 - For fixed-standing handshake arm training, use `--task handshake --fixed-standing --control-mode arms_only`.
+- Auto-curriculum is available via `--auto-curriculum`.
 
 ## Environment API
 
 The environment implements PettingZoo's `ParallelEnv` with two agents (`h0`, `h1`).
 
 - **Observation space**: `Box(low=-inf, high=inf, shape=(obs_dim,), dtype=float32)`
-  - Base obs (~41 dims): proprioception + partner relative features
-  - Task-specific obs: varies by task (3 for hug, 5 for handshake, 8 for box_lift)
-- **Action space**: `Box(low=-1, high=1, shape=(18,), dtype=float32)` — 18 actuators per humanoid
+  - Base obs (~58 dims): proprioception + partner relative features
+  - Task-specific obs: 3 for hug, 5 for handshake, 8 for box_lift
+- **Action space**: `Box(low=-1, high=1, shape=(18,), dtype=float32)` by default
+  - In `control_mode="arms_only"`, action dim is 6 per agent
 - **Reward**: Cooperative (same scalar for both agents)
 
 ### Constructor
@@ -121,12 +104,14 @@ The environment implements PettingZoo's `ParallelEnv` with two agents (`h0`, `h1
 ```python
 HumanoidCollabEnv(
     task="hug",          # Task name: "hug", "handshake", "box_lift"
-    render_mode=None,    # "human" or "rgb_array"
-    horizon=1000,        # Max steps per episode
-    frame_skip=5,        # Physics steps per action
-    hold_target=30,      # Success hold duration
-    stage=0,             # Curriculum stage
+    render_mode=None,     # "human" or "rgb_array"
+    horizon=1000,         # Max steps per episode
+    frame_skip=5,         # Physics steps per action
+    hold_target=30,       # Success hold duration
+    stage=0,              # Curriculum stage
     physics_profile="default",
+    fixed_standing=False,
+    control_mode="all",
 )
 ```
 
@@ -192,7 +177,7 @@ Switch stages at reset: `env.reset(options={"stage": 2})`
 ```
 humanoid_collab/
   env.py                    # HumanoidCollabEnv (PettingZoo ParallelEnv)
-  mjx_env.py                # MJXHumanoidCollabEnv (on-device JAX step path)
+  vector_env.py             # SubprocHumanoidCollabVecEnv (CPU subprocess vectorization)
   mjcf_builder.py           # Programmatic MJCF XML generation
   tasks/
     base.py                 # Abstract TaskConfig interface

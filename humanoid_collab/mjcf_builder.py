@@ -22,7 +22,7 @@ _PHYSICS_PROFILES: Dict[str, Dict[str, str]] = {
         "jacobian": "sparse",
         "cone": "pyramidal",
     },
-    # Training speed profile for batched MJX rollouts.
+    # Aggressive speed profile for training throughput.
     "train_fast": {
         "timestep": "0.005",
         "iterations": "12",

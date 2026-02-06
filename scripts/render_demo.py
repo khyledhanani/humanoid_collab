@@ -4,7 +4,6 @@ import argparse
 
 from humanoid_collab.env import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
-from humanoid_collab.mjx_env import MJXHumanoidCollabEnv
 from humanoid_collab.tasks.registry import available_tasks
 
 
@@ -17,15 +16,8 @@ def _make_env(
     fixed_standing: bool,
     control_mode: str,
 ):
-    if backend == "mjx":
-        return MJXHumanoidCollabEnv(
-            task=task,
-            render_mode=render_mode,
-            stage=stage,
-            physics_profile=physics_profile,
-            fixed_standing=fixed_standing,
-            control_mode=control_mode,
-        )
+    if backend != "cpu":
+        raise ValueError("Only backend='cpu' is supported.")
     return HumanoidCollabEnv(
         task=task,
         render_mode=render_mode,
@@ -139,7 +131,7 @@ def main():
                         choices=available_tasks(),
                         help="Task to render")
     parser.add_argument("--backend", type=str, default="cpu",
-                        choices=["cpu", "mjx"],
+                        choices=["cpu"],
                         help="Physics backend")
     parser.add_argument(
         "--physics-profile",

@@ -1,9 +1,9 @@
-"""Benchmark CPU vs MJX backend speed and estimate JIT break-even length.
+"""Benchmark CPU backend throughput for HumanoidCollab.
 
-MJX modes:
-- pettingzoo: Python env.step loop (compatibility path, slowest)
-- scan: on-device JAX scan over one env
-- scan-batched: on-device JAX scan over batched envs (max-throughput path)
+Modes:
+- single: Python step loop over one env
+- subproc: subprocess vectorized CPU envs
+- both: run both and print speedup
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
-from typing import Dict, List, Optional, Type
+from typing import Dict, List
 
 import numpy as np
 
@@ -19,23 +19,14 @@ from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.vector_env import SubprocHumanoidCollabVecEnv
 
-try:
-    from humanoid_collab import MJXHumanoidCollabEnv
-except Exception:
-    MJXHumanoidCollabEnv = None  # type: ignore[assignment]
 
-
-EnvType = Type[HumanoidCollabEnv]
-
-
-def _run_steps(
+def _run_steps_single(
     env: HumanoidCollabEnv,
     steps: int,
     rng: np.random.RandomState,
     act_dim: int,
     seed_base: int,
 ) -> float:
-    """Run fixed number of env steps and return elapsed seconds."""
     t0 = time.perf_counter()
     for i in range(steps):
         if not env.agents:
@@ -46,9 +37,7 @@ def _run_steps(
     return time.perf_counter() - t0
 
 
-def _benchmark_backend_step_loop(
-    env_cls: EnvType,
-    backend_name: str,
+def _benchmark_single(
     task: str,
     frame_skip: int,
     physics_profile: str,
@@ -56,13 +45,11 @@ def _benchmark_backend_step_loop(
     control_mode: str,
     horizons: List[int],
     repeats: int,
-    warmup_steps: int,
     seed: int,
 ) -> Dict[str, object]:
-    """Benchmark step-loop backend over horizons and repeats."""
-    env = env_cls(
+    env = HumanoidCollabEnv(
         task=task,
-        horizon=max(horizons) + warmup_steps + 1000,
+        horizon=max(horizons) + 1000,
         frame_skip=frame_skip,
         physics_profile=physics_profile,
         fixed_standing=fixed_standing,
@@ -71,19 +58,12 @@ def _benchmark_backend_step_loop(
     env.reset(seed=seed)
     act_dim = int(env.action_space("h0").shape[0])
 
-    compile_s: Optional[float] = None
-    if backend_name.startswith("mjx"):
-        rng = np.random.RandomState(seed)
-        compile_s = _run_steps(env, 1, rng, act_dim, seed + 100_000)
-        if warmup_steps > 0:
-            _run_steps(env, warmup_steps, rng, act_dim, seed + 110_000)
-
     horizon_times: Dict[int, List[float]] = {h: [] for h in horizons}
     for repeat in range(repeats):
         rng = np.random.RandomState(seed + repeat + 1)
         for horizon in horizons:
             env.reset(seed=seed + repeat + horizon)
-            dt = _run_steps(env, horizon, rng, act_dim, seed + repeat + horizon * 10)
+            dt = _run_steps_single(env, horizon, rng, act_dim, seed + repeat + horizon * 10)
             horizon_times[horizon].append(dt)
 
     env.close()
@@ -92,16 +72,16 @@ def _benchmark_backend_step_loop(
     for horizon, dts in horizon_times.items():
         mean_s = statistics.fmean(dts)
         stdev_s = statistics.pstdev(dts) if len(dts) > 1 else 0.0
+        effective_steps = float(horizon)
         horizon_summary[horizon] = {
             "mean_s": mean_s,
             "stdev_s": stdev_s,
-            "steps_per_s": horizon / mean_s if mean_s > 0 else 0.0,
-            "effective_steps": float(horizon),
+            "steps_per_s": effective_steps / mean_s if mean_s > 0 else 0.0,
+            "effective_steps": effective_steps,
         }
 
     return {
-        "backend": backend_name,
-        "compile_s": compile_s,
+        "backend": "cpu-single",
         "horizons": horizon_summary,
         "effective_multiplier": 1.0,
     }
@@ -124,7 +104,7 @@ def _run_steps_subproc(
     return time.perf_counter() - t0
 
 
-def _benchmark_cpu_subproc(
+def _benchmark_subproc(
     task: str,
     frame_skip: int,
     physics_profile: str,
@@ -178,7 +158,6 @@ def _benchmark_cpu_subproc(
 
     return {
         "backend": "cpu-subproc",
-        "compile_s": None,
         "horizons": horizon_summary,
         "effective_multiplier": multiplier,
         "num_envs": num_envs,
@@ -186,188 +165,13 @@ def _benchmark_cpu_subproc(
     }
 
 
-def _run_mjx_scan_once(
-    env,
-    steps: int,
-    act_dim: int,
-    seed: int,
-) -> float:
-    rng = np.random.RandomState(seed)
-    a0 = env._jnp.asarray(rng.uniform(-1.0, 1.0, size=(steps, act_dim)).astype(np.float32))
-    a1 = env._jnp.asarray(rng.uniform(-1.0, 1.0, size=(steps, act_dim)).astype(np.float32))
-    state0 = env.get_jax_state()
-
-    t0 = time.perf_counter()
-    state1 = env.rollout_jax(a0, a1, state=state0, commit=False)
-    env._jax.block_until_ready(state1.data.qpos)
-    return time.perf_counter() - t0
-
-
-def _run_mjx_scan_batched_once(
-    env,
-    steps: int,
-    act_dim: int,
-    batch_size: int,
-    seed: int,
-) -> float:
-    rng = np.random.RandomState(seed)
-    a0 = env._jnp.asarray(
-        rng.uniform(-1.0, 1.0, size=(batch_size, steps, act_dim)).astype(np.float32)
-    )
-    a1 = env._jnp.asarray(
-        rng.uniform(-1.0, 1.0, size=(batch_size, steps, act_dim)).astype(np.float32)
-    )
-    state_b = env.make_batched_state(batch_size=batch_size)
-
-    t0 = time.perf_counter()
-    state1_b = env.rollout_jax_batched(a0, a1, state_batched=state_b)
-    env._jax.block_until_ready(state1_b.data.qpos)
-    return time.perf_counter() - t0
-
-
-def _benchmark_mjx_scan(
-    task: str,
-    frame_skip: int,
-    physics_profile: str,
-    fixed_standing: bool,
-    control_mode: str,
-    horizons: List[int],
-    repeats: int,
-    warmup_steps: int,
-    seed: int,
-    batch_size: int,
-    batched: bool,
-) -> Dict[str, object]:
-    if MJXHumanoidCollabEnv is None:
-        raise RuntimeError("MJX backend is unavailable. Install with: pip install -e '.[mjx]'")
-
-    env = MJXHumanoidCollabEnv(
-        task=task,
-        horizon=max(horizons) + warmup_steps + 1000,
-        frame_skip=frame_skip,
-        physics_profile=physics_profile,
-        fixed_standing=fixed_standing,
-        control_mode=control_mode,
-        detailed_info=False,
-    )
-    env.reset(seed=seed)
-    act_dim = int(env.action_space("h0").shape[0])
-
-    if batched and batch_size <= 0:
-        raise ValueError("batch_size must be > 0")
-
-    # compile+first step
-    if batched:
-        compile_s = _run_mjx_scan_batched_once(env, steps=1, act_dim=act_dim, batch_size=batch_size, seed=seed + 100_000)
-    else:
-        compile_s = _run_mjx_scan_once(env, steps=1, act_dim=act_dim, seed=seed + 100_000)
-
-    # warmup after compile
-    if warmup_steps > 0:
-        if batched:
-            _run_mjx_scan_batched_once(
-                env,
-                steps=warmup_steps,
-                act_dim=act_dim,
-                batch_size=batch_size,
-                seed=seed + 110_000,
-            )
-        else:
-            _run_mjx_scan_once(
-                env,
-                steps=warmup_steps,
-                act_dim=act_dim,
-                seed=seed + 110_000,
-            )
-
-    horizon_times: Dict[int, List[float]] = {h: [] for h in horizons}
-    for repeat in range(repeats):
-        for horizon in horizons:
-            env.reset(seed=seed + repeat + horizon)
-            if batched:
-                dt = _run_mjx_scan_batched_once(
-                    env,
-                    steps=horizon,
-                    act_dim=act_dim,
-                    batch_size=batch_size,
-                    seed=seed + repeat + horizon * 10,
-                )
-            else:
-                dt = _run_mjx_scan_once(
-                    env,
-                    steps=horizon,
-                    act_dim=act_dim,
-                    seed=seed + repeat + horizon * 10,
-                )
-            horizon_times[horizon].append(dt)
-
-    env.close()
-
-    multiplier = float(batch_size if batched else 1)
-    horizon_summary = {}
-    for horizon, dts in horizon_times.items():
-        mean_s = statistics.fmean(dts)
-        stdev_s = statistics.pstdev(dts) if len(dts) > 1 else 0.0
-        effective_steps = float(horizon) * multiplier
-        horizon_summary[horizon] = {
-            "mean_s": mean_s,
-            "stdev_s": stdev_s,
-            "steps_per_s": effective_steps / mean_s if mean_s > 0 else 0.0,
-            "effective_steps": effective_steps,
-        }
-
-    backend_name = "mjx-scan-batched" if batched else "mjx-scan"
-    return {
-        "backend": backend_name,
-        "compile_s": compile_s,
-        "horizons": horizon_summary,
-        "effective_multiplier": multiplier,
-        "batch_size": batch_size if batched else 1,
-    }
-
-
-def _estimate_break_even(
-    cpu_results: Dict[str, object],
-    mjx_results: Dict[str, object],
-) -> Optional[float]:
-    """Estimate steps needed for MJX to amortize compile overhead."""
-    compile_s = mjx_results.get("compile_s")
-    if compile_s is None:
-        return None
-
-    # Break-even only meaningful for single-env equivalent throughput.
-    if float(mjx_results.get("effective_multiplier", 1.0)) != 1.0:
-        return None
-
-    cpu_horizons: Dict[int, Dict[str, float]] = cpu_results["horizons"]  # type: ignore[assignment]
-    mjx_horizons: Dict[int, Dict[str, float]] = mjx_results["horizons"]  # type: ignore[assignment]
-    common_h = sorted(set(cpu_horizons.keys()) & set(mjx_horizons.keys()))
-    if not common_h:
-        return None
-
-    h = common_h[-1]
-    cpu_step_s = cpu_horizons[h]["mean_s"] / cpu_horizons[h]["effective_steps"]
-    mjx_step_s = mjx_horizons[h]["mean_s"] / mjx_horizons[h]["effective_steps"]
-    delta = cpu_step_s - mjx_step_s
-    if delta <= 0:
-        return None
-
-    return float(compile_s / delta)
-
-
 def _print_results(results: Dict[str, object]) -> None:
     backend = str(results["backend"])
-    compile_s = results.get("compile_s")
     horizons: Dict[int, Dict[str, float]] = results["horizons"]  # type: ignore[assignment]
-    batch_size = int(results.get("batch_size", 1))
     num_envs = int(results.get("num_envs", 1))
     start_method = str(results.get("start_method", ""))
 
     print(f"\n[{backend.upper()}]")
-    if compile_s is not None:
-        print(f"compile+first_step: {compile_s:.4f}s")
-    if batch_size > 1:
-        print(f"batch_size: {batch_size}")
     if num_envs > 1:
         print(f"num_envs: {num_envs}")
     if start_method:
@@ -381,76 +185,55 @@ def _print_results(results: Dict[str, object]) -> None:
         )
 
 
+def _print_speedup(single: Dict[str, object], subproc: Dict[str, object]) -> None:
+    h_single: Dict[int, Dict[str, float]] = single["horizons"]  # type: ignore[assignment]
+    h_subproc: Dict[int, Dict[str, float]] = subproc["horizons"]  # type: ignore[assignment]
+    common_h = sorted(set(h_single.keys()) & set(h_subproc.keys()))
+    if not common_h:
+        return
+    print("\n[SPEEDUP: SUBPROC VS SINGLE]")
+    for h in common_h:
+        t_single = float(h_single[h]["steps_per_s"])
+        t_subproc = float(h_subproc[h]["steps_per_s"])
+        ratio = (t_subproc / t_single) if t_single > 0 else 0.0
+        print(f"horizon={h:>6d} | single={t_single:>10.1f} | subproc={t_subproc:>10.1f} | x{ratio:.2f}")
+
+
 def parse_args() -> argparse.Namespace:
     physics_profiles = available_physics_profiles()
 
-    parser = argparse.ArgumentParser(description="Benchmark HumanoidCollab CPU vs MJX backend.")
+    parser = argparse.ArgumentParser(description="Benchmark HumanoidCollab CPU backend.")
     parser.add_argument("--task", type=str, default="hug", choices=["hug", "handshake", "box_lift"])
     parser.add_argument("--frame-skip", type=int, default=5)
     parser.add_argument("--horizons", type=int, nargs="+", default=[100, 1000, 10000])
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--backend",
+        "--mode",
         type=str,
         default="both",
-        choices=["cpu", "mjx", "both"],
-        help="Which backend(s) to benchmark.",
+        choices=["single", "subproc", "both"],
+        help="Which CPU benchmark mode(s) to run.",
     )
     parser.add_argument(
-        "--mjx-mode",
-        type=str,
-        default="pettingzoo",
-        choices=["pettingzoo", "scan", "scan-batched"],
-        help="MJX benchmark mode. Use scan-batched for max throughput.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=128,
-        help="Batch size for --mjx-mode scan-batched.",
-    )
-    parser.add_argument(
-        "--batch-sweep",
-        type=int,
-        nargs="*",
-        default=None,
-        help="Optional list of batch sizes for scan-batched sweep (e.g. 64 128 256 512).",
-    )
-    parser.add_argument(
-        "--cpu-physics-profile",
+        "--physics-profile",
         type=str,
         default="default",
         choices=physics_profiles,
         help="Physics profile for CPU backend.",
     )
     parser.add_argument(
-        "--cpu-mode",
-        type=str,
-        default="single",
-        choices=["single", "subproc"],
-        help="CPU benchmark mode.",
-    )
-    parser.add_argument(
-        "--cpu-num-envs",
+        "--num-envs",
         type=int,
         default=8,
-        help="Number of subprocess envs for --cpu-mode subproc.",
+        help="Number of subprocess envs for subproc mode.",
     )
     parser.add_argument(
-        "--cpu-start-method",
+        "--start-method",
         type=str,
         default="forkserver",
         choices=["fork", "forkserver", "spawn"],
-        help="Multiprocessing start method for subprocess CPU mode.",
-    )
-    parser.add_argument(
-        "--mjx-physics-profile",
-        type=str,
-        default="train_fast",
-        choices=physics_profiles,
-        help="Physics profile for MJX backend.",
+        help="Multiprocessing start method for subproc mode.",
     )
     parser.add_argument(
         "--fixed-standing",
@@ -471,137 +254,44 @@ def main() -> None:
     args = parse_args()
     horizons = sorted(set(args.horizons))
 
-    run_cpu = args.backend in {"cpu", "both"}
-    run_mjx = args.backend in {"mjx", "both"}
+    run_single = args.mode in {"single", "both"}
+    run_subproc = args.mode in {"subproc", "both"}
 
-    cpu_results = None
-    mjx_results = None
+    single_results = None
+    subproc_results = None
 
-    if run_cpu:
-        if args.cpu_mode == "single":
-            cpu_results = _benchmark_backend_step_loop(
-                env_cls=HumanoidCollabEnv,
-                backend_name="cpu",
-                task=args.task,
-                frame_skip=args.frame_skip,
-                physics_profile=args.cpu_physics_profile,
-                fixed_standing=args.fixed_standing,
-                control_mode=args.control_mode,
-                horizons=horizons,
-                repeats=args.repeats,
-                warmup_steps=0,
-                seed=args.seed,
-            )
-        else:
-            cpu_results = _benchmark_cpu_subproc(
-                task=args.task,
-                frame_skip=args.frame_skip,
-                physics_profile=args.cpu_physics_profile,
-                fixed_standing=args.fixed_standing,
-                control_mode=args.control_mode,
-                num_envs=args.cpu_num_envs,
-                horizons=horizons,
-                repeats=args.repeats,
-                seed=args.seed,
-                start_method=args.cpu_start_method,
-            )
-        _print_results(cpu_results)
+    if run_single:
+        single_results = _benchmark_single(
+            task=args.task,
+            frame_skip=args.frame_skip,
+            physics_profile=args.physics_profile,
+            fixed_standing=args.fixed_standing,
+            control_mode=args.control_mode,
+            horizons=horizons,
+            repeats=args.repeats,
+            seed=args.seed,
+        )
+        _print_results(single_results)
 
-    if run_mjx:
-        if MJXHumanoidCollabEnv is None:
-            raise RuntimeError(
-                "MJX backend is unavailable. Install with: pip install -e '.[mjx]'"
-            )
-        try:
-            if args.mjx_mode == "pettingzoo":
-                mjx_results = _benchmark_backend_step_loop(
-                    env_cls=MJXHumanoidCollabEnv,
-                    backend_name="mjx-pettingzoo",
-                    task=args.task,
-                    frame_skip=args.frame_skip,
-                    physics_profile=args.mjx_physics_profile,
-                    fixed_standing=args.fixed_standing,
-                    control_mode=args.control_mode,
-                    horizons=horizons,
-                    repeats=args.repeats,
-                    warmup_steps=args.warmup_steps,
-                    seed=args.seed,
-                )
-            elif args.mjx_mode == "scan":
-                mjx_results = _benchmark_mjx_scan(
-                    task=args.task,
-                    frame_skip=args.frame_skip,
-                    physics_profile=args.mjx_physics_profile,
-                    fixed_standing=args.fixed_standing,
-                    control_mode=args.control_mode,
-                    horizons=horizons,
-                    repeats=args.repeats,
-                    warmup_steps=args.warmup_steps,
-                    seed=args.seed,
-                    batch_size=1,
-                    batched=False,
-                )
-            else:
-                if args.batch_sweep:
-                    sweep_sizes = sorted({int(v) for v in args.batch_sweep if int(v) > 0})
-                    if not sweep_sizes:
-                        raise ValueError("batch_sweep must include at least one positive integer.")
-                    sweep_results = []
-                    for bs in sweep_sizes:
-                        result = _benchmark_mjx_scan(
-                            task=args.task,
-                            frame_skip=args.frame_skip,
-                            physics_profile=args.mjx_physics_profile,
-                            fixed_standing=args.fixed_standing,
-                            control_mode=args.control_mode,
-                            horizons=horizons,
-                            repeats=args.repeats,
-                            warmup_steps=args.warmup_steps,
-                            seed=args.seed,
-                            batch_size=bs,
-                            batched=True,
-                        )
-                        _print_results(result)
-                        sweep_results.append(result)
-                    target_h = horizons[-1]
-                    best = max(
-                        sweep_results,
-                        key=lambda r: r["horizons"][target_h]["steps_per_s"],  # type: ignore[index]
-                    )
-                    best_bs = int(best.get("batch_size", -1))
-                    best_tput = float(best["horizons"][target_h]["steps_per_s"])  # type: ignore[index]
-                    print(
-                        f"\nBest scan-batched config at horizon={target_h}: "
-                        f"batch_size={best_bs}, throughput={best_tput:.1f} steps/s"
-                    )
-                    mjx_results = best
-                else:
-                    mjx_results = _benchmark_mjx_scan(
-                        task=args.task,
-                        frame_skip=args.frame_skip,
-                        physics_profile=args.mjx_physics_profile,
-                        fixed_standing=args.fixed_standing,
-                        control_mode=args.control_mode,
-                        horizons=horizons,
-                        repeats=args.repeats,
-                        warmup_steps=args.warmup_steps,
-                        seed=args.seed,
-                        batch_size=args.batch_size,
-                        batched=True,
-                    )
-        except ImportError as exc:
-            raise RuntimeError(
-                f"MJX backend is unavailable: {exc}. Install with: pip install -e '.[mjx]'"
-            ) from exc
-        if not (args.mjx_mode == "scan-batched" and args.batch_sweep):
-            _print_results(mjx_results)
+    if run_subproc:
+        if args.num_envs <= 0:
+            raise ValueError("--num-envs must be > 0")
+        subproc_results = _benchmark_subproc(
+            task=args.task,
+            frame_skip=args.frame_skip,
+            physics_profile=args.physics_profile,
+            fixed_standing=args.fixed_standing,
+            control_mode=args.control_mode,
+            num_envs=args.num_envs,
+            horizons=horizons,
+            repeats=args.repeats,
+            seed=args.seed,
+            start_method=args.start_method,
+        )
+        _print_results(subproc_results)
 
-    if cpu_results is not None and mjx_results is not None:
-        break_even = _estimate_break_even(cpu_results, mjx_results)
-        if break_even is None:
-            print("\nBreak-even estimate: not reached or not comparable for this mode.")
-        else:
-            print(f"\nEstimated break-even: ~{break_even:.0f} steps")
+    if single_results is not None and subproc_results is not None:
+        _print_speedup(single_results, subproc_results)
 
 
 if __name__ == "__main__":

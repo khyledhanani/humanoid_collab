@@ -11,11 +11,6 @@ import torch.nn as nn
 
 from humanoid_collab import HumanoidCollabEnv
 
-try:
-    from humanoid_collab import MJXHumanoidCollabEnv
-except Exception:
-    MJXHumanoidCollabEnv = None  # type: ignore[assignment]
-
 
 AGENTS = ("h0", "h1")
 
@@ -52,6 +47,11 @@ def parse_args() -> argparse.Namespace:
 
 def make_env_from_ckpt_args(train_args: Dict[str, object]):
     backend = str(train_args.get("backend", "cpu"))
+    if backend != "cpu":
+        raise ValueError(
+            f"Checkpoint backend='{backend}' is unsupported. "
+            "Only CPU checkpoints are supported."
+        )
     kwargs = dict(
         task=str(train_args.get("task", "handshake")),
         render_mode="human",
@@ -63,10 +63,6 @@ def make_env_from_ckpt_args(train_args: Dict[str, object]):
         fixed_standing=bool(train_args.get("fixed_standing", False)),
         control_mode=str(train_args.get("control_mode", "all")),
     )
-    if backend == "mjx":
-        if MJXHumanoidCollabEnv is None:
-            raise RuntimeError("MJX backend unavailable. Install with: pip install -e '.[mjx]'")
-        return MJXHumanoidCollabEnv(**kwargs)
     return HumanoidCollabEnv(**kwargs)
 
 

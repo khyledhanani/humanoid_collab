@@ -28,11 +28,6 @@ from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
 
 try:
-    from humanoid_collab import MJXHumanoidCollabEnv
-except Exception:
-    MJXHumanoidCollabEnv = None  # type: ignore[assignment]
-
-try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None  # type: ignore[assignment]
@@ -45,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train IPPO on HumanoidCollabEnv.")
 
     parser.add_argument("--task", type=str, default="handshake", choices=["hug", "handshake", "box_lift"])
-    parser.add_argument("--backend", type=str, default="cpu", choices=["cpu", "mjx"])
+    parser.add_argument("--backend", type=str, default="cpu", choices=["cpu"])
     parser.add_argument("--physics-profile", type=str, default="default", choices=available_physics_profiles())
     parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--horizon", type=int, default=1000)
@@ -251,10 +246,6 @@ def make_env(args: argparse.Namespace):
         fixed_standing=args.fixed_standing,
         control_mode=args.control_mode,
     )
-    if args.backend == "mjx":
-        if MJXHumanoidCollabEnv is None:
-            raise RuntimeError("MJX backend unavailable. Install with: pip install -e '.[mjx]'")
-        return MJXHumanoidCollabEnv(**kwargs)
     return HumanoidCollabEnv(**kwargs)
 
 
