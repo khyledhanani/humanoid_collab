@@ -106,6 +106,7 @@ def main() -> None:
                     actions[agent] = action.squeeze(0).cpu().numpy().astype(np.float32)
 
                 obs, rewards, terminations, truncations, infos = env.step(actions)
+                env.render()
                 ep_ret += float(rewards["h0"])
                 steps += 1
                 done = bool(terminations["h0"] or truncations["h0"])
