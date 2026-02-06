@@ -16,14 +16,14 @@ from humanoid_collab.utils.kinematics import (
 )
 
 
-# Curriculum weights per stage
+# Curriculum weights per stage (scaled down 10x for better value function learning)
 _HANDSHAKE_STAGES = {
-    0: dict(w_dist=2.0, w_face=1.0, w_stab=0.5, w_hand_prox=0.0, w_contact=0.0,
-            w_energy=-0.001, w_impact=-0.01, w_fall=-100.0, r_success=100.0),
-    1: dict(w_dist=1.5, w_face=1.0, w_stab=0.5, w_hand_prox=3.0, w_contact=0.0,
-            w_energy=-0.001, w_impact=-0.01, w_fall=-100.0, r_success=100.0),
-    2: dict(w_dist=1.0, w_face=0.8, w_stab=0.5, w_hand_prox=1.5, w_contact=5.0,
-            w_energy=-0.001, w_impact=-0.01, w_fall=-100.0, r_success=200.0),
+    0: dict(w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.0, w_contact=0.0,
+            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0),
+    1: dict(w_dist=0.15, w_face=0.10, w_stab=0.05, w_hand_prox=0.30, w_contact=2.0,
+            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0),
+    2: dict(w_dist=0.10, w_face=0.08, w_stab=0.05, w_hand_prox=0.15, w_contact=5.0,
+            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=100.0),
 }
 
 # Handshake thresholds
@@ -135,7 +135,15 @@ class HandshakeTask(TaskConfig):
             h0_rhand = id_cache.get_site_xpos(data, "h0_rhand")
             h1_rhand = id_cache.get_site_xpos(data, "h1_rhand")
             hand_dist = np.linalg.norm(h0_rhand - h1_rhand)
-            r_hand = w["w_hand_prox"] * np.exp(-4.0 * hand_dist)
+            
+            # Softer exponential decay for better gradients at longer distances
+            r_hand = w["w_hand_prox"] * np.exp(-2.0 * hand_dist)
+            
+            # Anneal hand shaping once contact is achieved to prevent hovering exploit
+            hand_contact = contact_info.get("h0_hand_h1_hand", False)
+            if hand_contact:
+                r_hand *= 0.3  # Reduce shaping when already in contact
+            
             total += r_hand
             info["hand_distance"] = hand_dist
             info["r_hand_prox"] = r_hand
