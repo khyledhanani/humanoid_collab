@@ -9,7 +9,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -77,6 +77,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every-updates", type=int, default=25)
     parser.add_argument("--print-every-updates", type=int, default=1)
     parser.add_argument("--no-tensorboard", action="store_true")
+
+    parser.add_argument("--auto-curriculum", action="store_true", help="Advance curriculum stage from success rate.")
+    parser.add_argument(
+        "--curriculum-window-episodes",
+        type=int,
+        default=40,
+        help="Episode window used to evaluate promotion success rate.",
+    )
+    parser.add_argument(
+        "--curriculum-success-threshold",
+        type=float,
+        default=0.6,
+        help="Default success-rate threshold for stage promotion.",
+    )
+    parser.add_argument(
+        "--curriculum-thresholds",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Optional per-promotion thresholds (from current stage upward).",
+    )
+    parser.add_argument(
+        "--curriculum-min-updates-per-stage",
+        type=int,
+        default=25,
+        help="Minimum number of updates before promoting from a stage.",
+    )
+
+    parser.add_argument("--fast-learn", action="store_true", help="Enable more aggressive PPO update settings.")
+    parser.add_argument(
+        "--adaptive-clip-by-kl",
+        action="store_true",
+        help="Adapt PPO clip coefficient based on measured KL.",
+    )
+    parser.add_argument(
+        "--adaptive-lr-by-kl",
+        action="store_true",
+        help="Adapt optimizer learning rate based on measured KL.",
+    )
+    parser.add_argument("--target-kl", type=float, default=0.03, help="KL target for adaptive policies.")
+    parser.add_argument("--clip-min", type=float, default=0.12)
+    parser.add_argument("--clip-max", type=float, default=0.40)
+    parser.add_argument("--clip-scale-up", type=float, default=1.10)
+    parser.add_argument("--clip-scale-down", type=float, default=0.85)
+    parser.add_argument("--lr-min", type=float, default=1e-5)
+    parser.add_argument("--lr-max", type=float, default=1e-3)
+    parser.add_argument("--lr-scale-up", type=float, default=1.08)
+    parser.add_argument("--lr-scale-down", type=float, default=0.80)
 
     return parser.parse_args()
 
@@ -210,13 +258,64 @@ def make_env(args: argparse.Namespace):
     return HumanoidCollabEnv(**kwargs)
 
 
+def _reset_env(env, seed: Optional[int], stage: int):
+    return env.reset(seed=seed, options={"stage": int(stage)})
+
+
+def _resolve_curriculum_threshold(
+    current_stage: int,
+    start_stage: int,
+    thresholds: Optional[list[float]],
+    default_threshold: float,
+) -> float:
+    if not thresholds:
+        return float(default_threshold)
+    idx = current_stage - start_stage
+    if idx < 0:
+        idx = 0
+    if idx >= len(thresholds):
+        return float(thresholds[-1])
+    return float(thresholds[idx])
+
+
 def train(args: argparse.Namespace) -> None:
+    if args.fast_learn:
+        args.adaptive_clip_by_kl = True
+        args.adaptive_lr_by_kl = True
+        args.clip_coef = max(args.clip_coef, 0.28)
+        args.clip_max = max(args.clip_max, 0.45)
+        args.lr = max(args.lr, 2e-4)
+        args.ppo_epochs = max(args.ppo_epochs, 6)
+        args.target_kl = max(args.target_kl, 0.03)
+
+    if args.anneal_lr and args.adaptive_lr_by_kl:
+        raise ValueError("--anneal-lr and --adaptive-lr-by-kl cannot be enabled together.")
+    if args.curriculum_window_episodes <= 0:
+        raise ValueError("--curriculum-window-episodes must be > 0.")
+    if args.curriculum_min_updates_per_stage <= 0:
+        raise ValueError("--curriculum-min-updates-per-stage must be > 0.")
+    if args.clip_min <= 0 or args.clip_min > args.clip_max:
+        raise ValueError("Invalid clip bounds: require 0 < clip-min <= clip-max.")
+    if args.lr_min <= 0 or args.lr_min > args.lr_max:
+        raise ValueError("Invalid lr bounds: require 0 < lr-min <= lr-max.")
+    if args.target_kl <= 0:
+        raise ValueError("--target-kl must be > 0.")
+    if args.curriculum_thresholds is not None:
+        for x in args.curriculum_thresholds:
+            if x < 0.0 or x > 1.0:
+                raise ValueError("--curriculum-thresholds values must be in [0, 1].")
+
     set_seed(args.seed)
     torch.set_num_threads(args.torch_threads)
     device = resolve_device(args.device)
 
     env = make_env(args)
-    obs, _ = env.reset(seed=args.seed)
+    max_stage = int(env.task_config.num_curriculum_stages) - 1
+    if max_stage < 0:
+        max_stage = 0
+    current_stage = int(max(0, min(args.stage, max_stage)))
+
+    obs, _ = _reset_env(env, seed=args.seed, stage=current_stage)
 
     obs_dim = int(env.observation_space("h0").shape[0])
     act_dim = int(env.action_space("h0").shape[0])
@@ -242,15 +341,20 @@ def train(args: argparse.Namespace) -> None:
     ep_len = 0
     completed_returns = []
     completed_lengths = []
+    completed_successes = []
     start_time = time.time()
+    updates_in_stage = 0
+    current_clip_coef = float(args.clip_coef)
+    current_lr = float(args.lr)
 
     for update in range(1, updates + 1):
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / updates
             lr_now = args.lr * frac
-            for opt in optimizers.values():
-                for g in opt.param_groups:
-                    g["lr"] = lr_now
+            current_lr = float(np.clip(lr_now, args.lr_min, args.lr_max))
+        for opt in optimizers.values():
+            for g in opt.param_groups:
+                g["lr"] = current_lr
 
         buffers = {agent: make_buffer(args.rollout_steps, obs_dim, act_dim) for agent in AGENTS}
         last_done = 0.0
@@ -284,11 +388,13 @@ def train(args: argparse.Namespace) -> None:
             last_done = done_f
 
             if done:
+                term_reason = str(infos["h0"].get("termination_reason", "unknown"))
                 completed_returns.append(ep_return)
                 completed_lengths.append(ep_len)
+                completed_successes.append(1.0 if term_reason == "success" else 0.0)
                 ep_return = 0.0
                 ep_len = 0
-                obs, _ = env.reset(seed=None)
+                obs, _ = _reset_env(env, seed=None, stage=current_stage)
             else:
                 obs = next_obs
 
@@ -318,7 +424,6 @@ def train(args: argparse.Namespace) -> None:
             b_logp_old = torch.as_tensor(b.logp, dtype=torch.float32, device=device)
             b_adv = torch.as_tensor(b.advantages, dtype=torch.float32, device=device)
             b_returns = torch.as_tensor(b.returns, dtype=torch.float32, device=device)
-            b_values_old = torch.as_tensor(b.values, dtype=torch.float32, device=device)
 
             b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
@@ -343,14 +448,12 @@ def train(args: argparse.Namespace) -> None:
 
                     with torch.no_grad():
                         approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                        clip_frac = (
-                            ((ratio - 1.0).abs() > args.clip_coef).float().mean()
-                        )
+                        clip_frac = (((ratio - 1.0).abs() > current_clip_coef).float().mean())
 
                     mb_adv = b_adv[mb_idx_t]
                     pg_loss1 = -mb_adv * ratio
                     pg_loss2 = -mb_adv * torch.clamp(
-                        ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef
+                        ratio, 1.0 - current_clip_coef, 1.0 + current_clip_coef
                     )
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
@@ -388,18 +491,69 @@ def train(args: argparse.Namespace) -> None:
         sps = int(global_step / max(1e-6, (time.time() - start_time)))
         mean_return = float(np.mean(completed_returns[-20:])) if completed_returns else 0.0
         mean_ep_len = float(np.mean(completed_lengths[-20:])) if completed_lengths else 0.0
+        mean_success_20 = float(np.mean(completed_successes[-20:])) if completed_successes else 0.0
+        success_window = float(
+            np.mean(completed_successes[-args.curriculum_window_episodes :])
+        ) if completed_successes else 0.0
+        mean_kl = float(np.mean([metrics["h0"]["approx_kl"], metrics["h1"]["approx_kl"]]))
+        updates_in_stage += 1
+
+        if args.adaptive_clip_by_kl:
+            if mean_kl < 0.5 * args.target_kl:
+                current_clip_coef = float(np.clip(
+                    current_clip_coef * args.clip_scale_up, args.clip_min, args.clip_max
+                ))
+            elif mean_kl > args.target_kl:
+                current_clip_coef = float(np.clip(
+                    current_clip_coef * args.clip_scale_down, args.clip_min, args.clip_max
+                ))
+
+        if args.adaptive_lr_by_kl:
+            if mean_kl < 0.5 * args.target_kl:
+                current_lr = float(np.clip(current_lr * args.lr_scale_up, args.lr_min, args.lr_max))
+            elif mean_kl > args.target_kl:
+                current_lr = float(np.clip(current_lr * args.lr_scale_down, args.lr_min, args.lr_max))
+
+        stage_up_msg = None
+        if args.auto_curriculum and current_stage < max_stage:
+            threshold = _resolve_curriculum_threshold(
+                current_stage=current_stage,
+                start_stage=int(args.stage),
+                thresholds=args.curriculum_thresholds,
+                default_threshold=args.curriculum_success_threshold,
+            )
+            enough_episodes = len(completed_successes) >= args.curriculum_window_episodes
+            enough_updates = updates_in_stage >= args.curriculum_min_updates_per_stage
+            if enough_episodes and enough_updates and success_window >= threshold:
+                prev_stage = current_stage
+                current_stage += 1
+                updates_in_stage = 0
+                stage_up_msg = (
+                    f"curriculum: stage {prev_stage} -> {current_stage} "
+                    f"(success_window={success_window:.2f} threshold={threshold:.2f})"
+                )
 
         if update % args.print_every_updates == 0:
             print(
                 f"update={update}/{updates} step={global_step} sps={sps} "
-                f"ret20={mean_return:.2f} len20={mean_ep_len:.1f} "
-                f"h0_kl={metrics['h0']['approx_kl']:.4f} h1_kl={metrics['h1']['approx_kl']:.4f}"
+                f"stage={current_stage} ret20={mean_return:.2f} len20={mean_ep_len:.1f} "
+                f"succ20={mean_success_20:.2f} succW={success_window:.2f} "
+                f"h0_kl={metrics['h0']['approx_kl']:.4f} h1_kl={metrics['h1']['approx_kl']:.4f} "
+                f"clip={current_clip_coef:.3f} lr={current_lr:.6f}"
             )
+            if stage_up_msg is not None:
+                print(stage_up_msg)
 
         if writer is not None:
             writer.add_scalar("charts/sps", sps, global_step)
             writer.add_scalar("charts/ep_return_mean_20", mean_return, global_step)
             writer.add_scalar("charts/ep_len_mean_20", mean_ep_len, global_step)
+            writer.add_scalar("charts/ep_success_mean_20", mean_success_20, global_step)
+            writer.add_scalar("charts/ep_success_window", success_window, global_step)
+            writer.add_scalar("charts/curriculum_stage", current_stage, global_step)
+            writer.add_scalar("charts/mean_kl", mean_kl, global_step)
+            writer.add_scalar("charts/clip_coef", current_clip_coef, global_step)
+            writer.add_scalar("charts/lr", current_lr, global_step)
             for agent in AGENTS:
                 for k, v in metrics[agent].items():
                     writer.add_scalar(f"{agent}/{k}", v, global_step)
@@ -410,6 +564,9 @@ def train(args: argparse.Namespace) -> None:
                 "args": vars(args),
                 "global_step": global_step,
                 "update": update,
+                "stage": current_stage,
+                "clip_coef": current_clip_coef,
+                "lr": current_lr,
                 "obs_dim": obs_dim,
                 "act_dim": act_dim,
                 "policies": {a: policies[a].state_dict() for a in AGENTS},
