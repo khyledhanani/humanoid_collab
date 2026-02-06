@@ -50,9 +50,16 @@ class HandshakeTask(TaskConfig):
         self._weights = _HANDSHAKE_STAGES[0].copy()
         self._stage = 0
 
+    # The four possible one-hand-to-one-hand pairs
+    HAND_PAIRS = [
+        ("h0_r_hand_h1_r_hand", "h0_rhand", "h1_rhand"),
+        ("h0_r_hand_h1_l_hand", "h0_rhand", "h1_lhand"),
+        ("h0_l_hand_h1_r_hand", "h0_lhand", "h1_rhand"),
+        ("h0_l_hand_h1_l_hand", "h0_lhand", "h1_lhand"),
+    ]
+
     def get_contact_pairs(self) -> List[Tuple[str, str, str]]:
         return [
-            ("h0_hand_h1_hand", "h0_hand", "h1_hand"),
             ("h0_r_hand_h1_r_hand", "h0_r_hand", "h1_r_hand"),
             ("h0_r_hand_h1_l_hand", "h0_r_hand", "h1_l_hand"),
             ("h0_l_hand_h1_r_hand", "h0_l_hand", "h1_r_hand"),
@@ -130,29 +137,47 @@ class HandshakeTask(TaskConfig):
         info["relative_speed"] = rel_speed
         info["r_stability"] = r_stab
 
-        # Hand proximity shaping (right hands toward each other)
+        # --- Hand proximity shaping (toward closest opposing hand) ---
+        # Compute distances for all four one-hand-to-one-hand pairs
+        pair_dists = {}
+        for pair_key, site_a, site_b in self.HAND_PAIRS:
+            pos_a = id_cache.get_site_xpos(data, site_a)
+            pos_b = id_cache.get_site_xpos(data, site_b)
+            pair_dists[pair_key] = np.linalg.norm(pos_a - pos_b)
+
+        # Find the closest pair -- let agents discover which one works
+        best_pair = min(pair_dists, key=pair_dists.get)
+        best_dist = pair_dists[best_pair]
+
         if w["w_hand_prox"] > 0:
-            h0_rhand = id_cache.get_site_xpos(data, "h0_rhand")
-            h1_rhand = id_cache.get_site_xpos(data, "h1_rhand")
-            hand_dist = np.linalg.norm(h0_rhand - h1_rhand)
-            
             # Softer exponential decay for better gradients at longer distances
-            r_hand = w["w_hand_prox"] * np.exp(-2.0 * hand_dist)
-            
-            # Anneal hand shaping once contact is achieved to prevent hovering exploit
-            hand_contact = contact_info.get("h0_hand_h1_hand", False)
-            if hand_contact:
+            r_hand = w["w_hand_prox"] * np.exp(-2.0 * best_dist)
+
+            # Anneal hand shaping once contact is achieved
+            if contact_info.get(best_pair, False):
                 r_hand *= 0.3  # Reduce shaping when already in contact
-            
+
             total += r_hand
-            info["hand_distance"] = hand_dist
             info["r_hand_prox"] = r_hand
         else:
             info["r_hand_prox"] = 0.0
+        info["hand_distance"] = best_dist
+        info["hand_pair_selected"] = best_pair
 
-        # Contact reward
-        hand_contact = int(contact_info.get("h0_hand_h1_hand", False))
-        r_contact = w["w_contact"] * hand_contact
+        # --- Contact reward: exactly one hand pair touching = handshake ---
+        active_pairs = [k for k in pair_dists if contact_info.get(k, False)]
+        num_contacts = len(active_pairs)
+        info["hand_contact_pairs"] = num_contacts
+        info["hand_active_pairs"] = active_pairs
+
+        if num_contacts == 1:
+            # Exactly one hand pair in contact -- proper handshake
+            r_contact = w["w_contact"]
+        elif num_contacts > 1:
+            # Multiple hand pairs touching -- penalize (not a handshake)
+            r_contact = -0.5 * w["w_contact"]
+        else:
+            r_contact = 0.0
         total += r_contact
         info["r_contact"] = r_contact
 
@@ -198,8 +223,12 @@ class HandshakeTask(TaskConfig):
         info["shake_facing"] = facing
         info["shake_facing_ok"] = facing_ok
 
-        contact_ok = contact_info.get("h0_hand_h1_hand", False)
+        # Exactly one hand pair must be in contact (proper handshake)
+        active_pairs = [pk for pk, _, _ in self.HAND_PAIRS
+                        if contact_info.get(pk, False)]
+        contact_ok = len(active_pairs) == 1
         info["shake_contact_ok"] = contact_ok
+        info["shake_active_pairs"] = active_pairs
 
         h0_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h0"])
         h1_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h1"])
