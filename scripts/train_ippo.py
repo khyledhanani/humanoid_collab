@@ -314,6 +314,18 @@ def train(args: argparse.Namespace) -> None:
     if max_stage < 0:
         max_stage = 0
     current_stage = int(max(0, min(args.stage, max_stage)))
+    if (
+        args.task == "handshake"
+        and bool(args.fixed_standing)
+        and args.control_mode == "arms_only"
+        and current_stage == 0
+        and max_stage >= 1
+    ):
+        current_stage = 1
+        print(
+            "curriculum guard: using stage 1 instead of stage 0 for "
+            "handshake + fixed-standing + arms_only."
+        )
 
     obs, _ = _reset_env(env, seed=args.seed, stage=current_stage)
 
