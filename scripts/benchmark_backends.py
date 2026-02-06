@@ -17,7 +17,10 @@ import numpy as np
 
 from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
-from humanoid_collab.vector_env import SubprocHumanoidCollabVecEnv
+from humanoid_collab.vector_env import (
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 
 
 def _run_steps_single(
@@ -87,8 +90,8 @@ def _benchmark_single(
     }
 
 
-def _run_steps_subproc(
-    vec_env: SubprocHumanoidCollabVecEnv,
+def _run_steps_vec(
+    vec_env,
     steps: int,
     rng: np.random.RandomState,
     act_dim: int,
@@ -115,6 +118,7 @@ def _benchmark_subproc(
     repeats: int,
     seed: int,
     start_method: str,
+    vec_env_backend: str,
 ) -> Dict[str, object]:
     env_kwargs = {
         "task": task,
@@ -124,12 +128,22 @@ def _benchmark_subproc(
         "fixed_standing": fixed_standing,
         "control_mode": control_mode,
     }
-    vec_env = SubprocHumanoidCollabVecEnv(
-        num_envs=num_envs,
-        env_kwargs=env_kwargs,
-        auto_reset=True,
-        start_method=start_method,
-    )
+    if vec_env_backend == "shared_memory":
+        vec_env = SharedMemHumanoidCollabVecEnv(
+            num_envs=num_envs,
+            env_kwargs=env_kwargs,
+            auto_reset=True,
+            start_method=start_method,
+        )
+    elif vec_env_backend == "subproc":
+        vec_env = SubprocHumanoidCollabVecEnv(
+            num_envs=num_envs,
+            env_kwargs=env_kwargs,
+            auto_reset=True,
+            start_method=start_method,
+        )
+    else:
+        raise ValueError(f"Unknown vec env backend '{vec_env_backend}'")
     vec_env.reset(seed=seed)
     act_dim = int(vec_env.action_space("h0").shape[0])
 
@@ -138,7 +152,7 @@ def _benchmark_subproc(
         rng = np.random.RandomState(seed + repeat + 1)
         for horizon in horizons:
             vec_env.reset(seed=seed + repeat + horizon)
-            dt = _run_steps_subproc(vec_env, horizon, rng, act_dim)
+            dt = _run_steps_vec(vec_env, horizon, rng, act_dim)
             horizon_times[horizon].append(dt)
 
     vec_env.close()
@@ -157,11 +171,12 @@ def _benchmark_subproc(
         }
 
     return {
-        "backend": "cpu-subproc",
+        "backend": f"cpu-{vec_env_backend}",
         "horizons": horizon_summary,
         "effective_multiplier": multiplier,
         "num_envs": num_envs,
         "start_method": start_method,
+        "vec_env_backend": vec_env_backend,
     }
 
 
@@ -170,12 +185,15 @@ def _print_results(results: Dict[str, object]) -> None:
     horizons: Dict[int, Dict[str, float]] = results["horizons"]  # type: ignore[assignment]
     num_envs = int(results.get("num_envs", 1))
     start_method = str(results.get("start_method", ""))
+    vec_env_backend = str(results.get("vec_env_backend", ""))
 
     print(f"\n[{backend.upper()}]")
     if num_envs > 1:
         print(f"num_envs: {num_envs}")
     if start_method:
         print(f"start_method: {start_method}")
+    if vec_env_backend:
+        print(f"vec_env_backend: {vec_env_backend}")
     for h in sorted(horizons.keys()):
         row = horizons[h]
         print(
@@ -191,7 +209,7 @@ def _print_speedup(single: Dict[str, object], subproc: Dict[str, object]) -> Non
     common_h = sorted(set(h_single.keys()) & set(h_subproc.keys()))
     if not common_h:
         return
-    print("\n[SPEEDUP: SUBPROC VS SINGLE]")
+    print("\n[SPEEDUP: VECTOR VS SINGLE]")
     for h in common_h:
         t_single = float(h_single[h]["steps_per_s"])
         t_subproc = float(h_subproc[h]["steps_per_s"])
@@ -234,6 +252,13 @@ def parse_args() -> argparse.Namespace:
         default="forkserver",
         choices=["fork", "forkserver", "spawn"],
         help="Multiprocessing start method for subproc mode.",
+    )
+    parser.add_argument(
+        "--vec-env-backend",
+        type=str,
+        default="shared_memory",
+        choices=["shared_memory", "subproc"],
+        help="Vector env backend used in subproc mode.",
     )
     parser.add_argument(
         "--fixed-standing",
@@ -287,6 +312,7 @@ def main() -> None:
             repeats=args.repeats,
             seed=args.seed,
             start_method=args.start_method,
+            vec_env_backend=args.vec_env_backend,
         )
         _print_results(subproc_results)
 

@@ -25,7 +25,11 @@ except ImportError as exc:
         "pip install -e '.[train]'"
     ) from exc
 
-from humanoid_collab import HumanoidCollabEnv, SubprocHumanoidCollabVecEnv
+from humanoid_collab import (
+    HumanoidCollabEnv,
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.utils.exp_logging import ExperimentLogger
 
@@ -49,6 +53,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--total-steps", type=int, default=800_000, help="Total environment transitions.")
     parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument(
+        "--vec-env-backend",
+        type=str,
+        default="shared_memory",
+        choices=["shared_memory", "subproc"],
+        help="Vector env backend used when --num-envs > 1.",
+    )
     parser.add_argument("--start-method", type=str, default=None)
 
     parser.add_argument("--buffer-size", type=int, default=500_000)
@@ -293,12 +304,20 @@ def _build_env(
         env = HumanoidCollabEnv(**env_kwargs)
         obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
     else:
-        env = SubprocHumanoidCollabVecEnv(
-            num_envs=args.num_envs,
-            env_kwargs=env_kwargs,
-            auto_reset=True,
-            start_method=args.start_method,
-        )
+        if args.vec_env_backend == "shared_memory":
+            env = SharedMemHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
+        else:
+            env = SubprocHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
         obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
     obs_batch = _format_reset_obs(obs, args.num_envs)
     return env, obs_batch, infos

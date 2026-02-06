@@ -1,7 +1,14 @@
 """Humanoid Collab: Two-agent humanoid collaboration environment with multiple tasks."""
 
 from humanoid_collab.env import HumanoidCollabEnv
-from humanoid_collab.vector_env import SubprocHumanoidCollabVecEnv
+from humanoid_collab.vector_env import (
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 
-__all__ = ["HumanoidCollabEnv", "SubprocHumanoidCollabVecEnv"]
+__all__ = [
+    "HumanoidCollabEnv",
+    "SubprocHumanoidCollabVecEnv",
+    "SharedMemHumanoidCollabVecEnv",
+]
 __version__ = "0.1.0"

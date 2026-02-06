@@ -1,12 +1,20 @@
 """Tests for subprocess vectorized CPU environment."""
 
 import numpy as np
+import pytest
 
-from humanoid_collab.vector_env import SubprocHumanoidCollabVecEnv
+from humanoid_collab.vector_env import (
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 
 
-def test_vector_env_reset_and_step_shapes():
-    vec = SubprocHumanoidCollabVecEnv(
+@pytest.mark.parametrize(
+    "vec_cls",
+    [SubprocHumanoidCollabVecEnv, SharedMemHumanoidCollabVecEnv],
+)
+def test_vector_env_reset_and_step_shapes(vec_cls):
+    vec = vec_cls(
         num_envs=2,
         env_kwargs={"task": "hug", "horizon": 64, "physics_profile": "default"},
         auto_reset=True,
@@ -33,8 +41,12 @@ def test_vector_env_reset_and_step_shapes():
         vec.close()
 
 
-def test_vector_env_auto_reset_runs_past_horizon():
-    vec = SubprocHumanoidCollabVecEnv(
+@pytest.mark.parametrize(
+    "vec_cls",
+    [SubprocHumanoidCollabVecEnv, SharedMemHumanoidCollabVecEnv],
+)
+def test_vector_env_auto_reset_runs_past_horizon(vec_cls):
+    vec = vec_cls(
         num_envs=2,
         env_kwargs={"task": "hug", "horizon": 2, "physics_profile": "default"},
         auto_reset=True,
@@ -54,4 +66,3 @@ def test_vector_env_auto_reset_runs_past_horizon():
             assert obs["h0"].shape[0] == 2
     finally:
         vec.close()
-
