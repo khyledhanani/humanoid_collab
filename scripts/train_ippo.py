@@ -26,11 +26,7 @@ except ImportError as exc:
 
 from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    SummaryWriter = None  # type: ignore[assignment]
+from humanoid_collab.utils.exp_logging import ExperimentLogger
 
 
 AGENTS = ("h0", "h1")
@@ -71,7 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", type=str, default="checkpoints/ippo_handshake_fixed_arms")
     parser.add_argument("--save-every-updates", type=int, default=25)
     parser.add_argument("--print-every-updates", type=int, default=1)
-    parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="humanoid-collab")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default="ippo")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     parser.add_argument("--auto-curriculum", action="store_true", help="Advance curriculum stage from success rate.")
     parser.add_argument(
@@ -334,8 +336,19 @@ def train(args: argparse.Namespace) -> None:
         agent: optim.Adam(policies[agent].parameters(), lr=args.lr, eps=1e-5) for agent in AGENTS
     }
 
-    use_tb = (not args.no_tensorboard) and SummaryWriter is not None
-    writer = SummaryWriter(args.log_dir) if use_tb else None
+    os.makedirs(args.log_dir, exist_ok=True)
+    wandb_enabled = (not args.no_wandb) and args.wandb_mode != "disabled"
+    logger = ExperimentLogger.create(
+        enabled=wandb_enabled,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        mode=args.wandb_mode,
+        run_dir=args.log_dir,
+        config=vars(args),
+    )
     os.makedirs(args.save_dir, exist_ok=True)
 
     global_step = 0
@@ -547,19 +560,29 @@ def train(args: argparse.Namespace) -> None:
             if stage_up_msg is not None:
                 print(stage_up_msg)
 
-        if writer is not None:
-            writer.add_scalar("charts/sps", sps, global_step)
-            writer.add_scalar("charts/ep_return_mean_20", mean_return, global_step)
-            writer.add_scalar("charts/ep_len_mean_20", mean_ep_len, global_step)
-            writer.add_scalar("charts/ep_success_mean_20", mean_success_20, global_step)
-            writer.add_scalar("charts/ep_success_window", success_window, global_step)
-            writer.add_scalar("charts/curriculum_stage", current_stage, global_step)
-            writer.add_scalar("charts/mean_kl", mean_kl, global_step)
-            writer.add_scalar("charts/clip_coef", current_clip_coef, global_step)
-            writer.add_scalar("charts/lr", current_lr, global_step)
-            for agent in AGENTS:
-                for k, v in metrics[agent].items():
-                    writer.add_scalar(f"{agent}/{k}", v, global_step)
+        algo_metrics = {
+            "mean_kl": mean_kl,
+            "clip_coef": current_clip_coef,
+            "lr": current_lr,
+        }
+        for agent in AGENTS:
+            for k, v in metrics[agent].items():
+                algo_metrics[f"{agent}/{k}"] = v
+        logger.log(
+            step=global_step,
+            common={
+                "sps": sps,
+                "ep_return_mean_20": mean_return,
+                "ep_len_mean_20": mean_ep_len,
+                "ep_success_mean_20": mean_success_20,
+                "ep_success_window": success_window,
+                "curriculum_stage": current_stage,
+            },
+            algo=algo_metrics,
+            task={
+                "stage": current_stage,
+            },
+        )
 
         if update % args.save_every_updates == 0 or update == updates:
             ckpt_path = os.path.join(args.save_dir, f"ippo_update_{update:06d}.pt")
@@ -578,8 +601,7 @@ def train(args: argparse.Namespace) -> None:
             torch.save(payload, ckpt_path)
 
     env.close()
-    if writer is not None:
-        writer.close()
+    logger.finish()
     print("Training complete.")
 
 

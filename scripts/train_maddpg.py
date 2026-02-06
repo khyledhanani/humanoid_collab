@@ -27,11 +27,7 @@ except ImportError as exc:
 
 from humanoid_collab import HumanoidCollabEnv, SubprocHumanoidCollabVecEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    SummaryWriter = None  # type: ignore[assignment]
+from humanoid_collab.utils.exp_logging import ExperimentLogger
 
 
 AGENTS = ("h0", "h1")
@@ -114,7 +110,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", type=str, default="checkpoints/maddpg_handshake_fixed_arms")
     parser.add_argument("--save-every-steps", type=int, default=50_000)
     parser.add_argument("--print-every-steps", type=int, default=2_048)
-    parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="humanoid-collab")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default="maddpg")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     return parser.parse_args()
 
@@ -470,8 +472,19 @@ def train(args: argparse.Namespace) -> None:
         act_dim=act_dim,
     )
 
-    use_tb = (not args.no_tensorboard) and SummaryWriter is not None
-    writer = SummaryWriter(args.log_dir) if use_tb else None
+    os.makedirs(args.log_dir, exist_ok=True)
+    wandb_enabled = (not args.no_wandb) and args.wandb_mode != "disabled"
+    logger = ExperimentLogger.create(
+        enabled=wandb_enabled,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        mode=args.wandb_mode,
+        run_dir=args.log_dir,
+        config=vars(args),
+    )
     os.makedirs(args.save_dir, exist_ok=True)
 
     ep_returns = np.zeros(args.num_envs, dtype=np.float32)
@@ -710,36 +723,34 @@ def train(args: argparse.Namespace) -> None:
                     print(stage_up_msg)
                 last_print_step = global_step
 
-                if writer is not None:
-                    writer.add_scalar("charts/sps", sps, global_step)
-                    writer.add_scalar("charts/ep_return_mean_20", mean_return, global_step)
-                    writer.add_scalar("charts/ep_len_mean_20", mean_len, global_step)
-                    writer.add_scalar("charts/ep_success_mean_20", mean_success_20, global_step)
-                    writer.add_scalar("charts/ep_success_window", success_window, global_step)
-                    writer.add_scalar("charts/curriculum_stage", current_stage, global_step)
-                    writer.add_scalar("charts/replay_size", replay.size, global_step)
-                    writer.add_scalar("charts/noise_std", current_noise, global_step)
-                    writer.add_scalar("charts/grad_updates", grad_updates, global_step)
-                    writer.add_scalar("charts/actor_updates", actor_updates, global_step)
-                    for agent in AGENTS:
-                        if critic_loss_hist[agent]:
-                            writer.add_scalar(
-                                f"{agent}/critic_loss",
-                                float(np.mean(critic_loss_hist[agent][-100:])),
-                                global_step,
-                            )
-                        if actor_loss_hist[agent]:
-                            writer.add_scalar(
-                                f"{agent}/actor_loss",
-                                float(np.mean(actor_loss_hist[agent][-100:])),
-                                global_step,
-                            )
-                        if q_hist[agent]:
-                            writer.add_scalar(
-                                f"{agent}/q_mean",
-                                float(np.mean(q_hist[agent][-100:])),
-                                global_step,
-                            )
+                algo_metrics = {
+                    "replay_size": replay.size,
+                    "noise_std": current_noise,
+                    "grad_updates": grad_updates,
+                    "actor_updates": actor_updates,
+                }
+                for agent in AGENTS:
+                    if critic_loss_hist[agent]:
+                        algo_metrics[f"{agent}/critic_loss"] = float(np.mean(critic_loss_hist[agent][-100:]))
+                    if actor_loss_hist[agent]:
+                        algo_metrics[f"{agent}/actor_loss"] = float(np.mean(actor_loss_hist[agent][-100:]))
+                    if q_hist[agent]:
+                        algo_metrics[f"{agent}/q_mean"] = float(np.mean(q_hist[agent][-100:]))
+                logger.log(
+                    step=global_step,
+                    common={
+                        "sps": sps,
+                        "ep_return_mean_20": mean_return,
+                        "ep_len_mean_20": mean_len,
+                        "ep_success_mean_20": mean_success_20,
+                        "ep_success_window": success_window,
+                        "curriculum_stage": current_stage,
+                    },
+                    algo=algo_metrics,
+                    task={
+                        "stage": current_stage,
+                    },
+                )
 
             if global_step - last_save_step >= args.save_every_steps or global_step >= args.total_steps:
                 ckpt_path = os.path.join(args.save_dir, f"maddpg_step_{global_step:07d}.pt")
@@ -763,8 +774,7 @@ def train(args: argparse.Namespace) -> None:
 
     finally:
         env.close()
-        if writer is not None:
-            writer.close()
+        logger.finish()
 
     print("Training complete.")
 

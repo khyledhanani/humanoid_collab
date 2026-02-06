@@ -95,6 +95,17 @@ MADDPG training:
 - Actors only consume each agent's local observation; critics consume joint observations/actions during training.
 - Use GPU for model updates via `--device cuda` (env simulation remains CPU MuJoCo).
 
+Experiment logging (W&B):
+- Training scripts use a shared logger with metric namespaces:
+  - `common/*`: throughput, returns, episode length, success rate, curriculum stage
+  - `algo/*`: algorithm-specific losses/diagnostics
+  - `task/*`: task/curriculum signals
+- Useful flags:
+  - `--wandb-project humanoid-collab`
+  - `--wandb-group ippo` or `--wandb-group maddpg`
+  - `--wandb-mode online|offline|disabled`
+  - `--wandb-run-name <name>`
+
 ## Environment API
 
 The environment implements PettingZoo's `ParallelEnv` with two agents (`h0`, `h1`).
