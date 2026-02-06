@@ -16,6 +16,8 @@ def run_rollout(
     seed: int = 42,
     backend: str = "cpu",
     physics_profile: str = "default",
+    fixed_standing: bool = False,
+    control_mode: str = "all",
 ):
     if backend == "mjx":
         env = MJXHumanoidCollabEnv(
@@ -23,6 +25,8 @@ def run_rollout(
             horizon=1000,
             stage=stage,
             physics_profile=physics_profile,
+            fixed_standing=fixed_standing,
+            control_mode=control_mode,
         )
     else:
         env = HumanoidCollabEnv(
@@ -30,12 +34,16 @@ def run_rollout(
             horizon=1000,
             stage=stage,
             physics_profile=physics_profile,
+            fixed_standing=fixed_standing,
+            control_mode=control_mode,
         )
 
     print(f"Task: {task}")
     print(f"Stage: {stage}")
     print(f"Backend: {backend}")
     print(f"Physics profile: {physics_profile}")
+    print(f"Fixed standing: {fixed_standing}")
+    print(f"Control mode: {control_mode}")
     print(f"Obs dim: {env.observation_space('h0').shape}")
     print(f"Act dim: {env.action_space('h0').shape}")
     print(f"Running {num_episodes} episodes with random actions...\n")
@@ -107,6 +115,18 @@ def main():
         choices=available_physics_profiles(),
         help="MuJoCo physics profile.",
     )
+    parser.add_argument(
+        "--fixed-standing",
+        action="store_true",
+        help="Weld torsos to world to disable locomotion.",
+    )
+    parser.add_argument(
+        "--control-mode",
+        type=str,
+        default="all",
+        choices=["all", "arms_only"],
+        help="Actuator subset controlled by RL.",
+    )
     parser.add_argument("--episodes", type=int, default=3, help="Number of episodes")
     parser.add_argument("--stage", type=int, default=0, help="Curriculum stage")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -119,6 +139,8 @@ def main():
         args.seed,
         args.backend,
         args.physics_profile,
+        args.fixed_standing,
+        args.control_mode,
     )
 
 

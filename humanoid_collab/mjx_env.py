@@ -111,6 +111,8 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
         hold_target: int = 30,
         stage: int = 0,
         physics_profile: str = "train_fast",
+        fixed_standing: bool = False,
+        control_mode: str = "all",
         jit: bool = True,
         detailed_info: bool = False,
     ):
@@ -126,6 +128,8 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
             hold_target=hold_target,
             stage=stage,
             physics_profile=physics_profile,
+            fixed_standing=fixed_standing,
+            control_mode=control_mode,
         )
 
         self._backend = "mjx"
@@ -152,8 +156,8 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
         """Prepare static index arrays/constants consumed by JAX kernels."""
         jnp = self._jnp
 
-        self._h0_act_idx = jnp.asarray(self.id_cache.actuator_idx["h0"], dtype=jnp.int32)
-        self._h1_act_idx = jnp.asarray(self.id_cache.actuator_idx["h1"], dtype=jnp.int32)
+        self._h0_act_idx = jnp.asarray(self._control_actuator_idx["h0"], dtype=jnp.int32)
+        self._h1_act_idx = jnp.asarray(self._control_actuator_idx["h1"], dtype=jnp.int32)
 
         self._h0_qpos_idx = jnp.asarray(self.id_cache.joint_qpos_idx["h0"], dtype=jnp.int32)
         self._h1_qpos_idx = jnp.asarray(self.id_cache.joint_qpos_idx["h1"], dtype=jnp.int32)
@@ -1060,6 +1064,8 @@ class MJXHumanoidCollabEnv(HumanoidCollabEnv):
                 "task": self.task_name,
                 "stage": self.stage,
                 "physics_profile": self.physics_profile,
+                "fixed_standing": self.fixed_standing,
+                "control_mode": self.control_mode,
                 "backend": self._backend,
                 "jit": self._jit,
                 "total_reward": reward_value,

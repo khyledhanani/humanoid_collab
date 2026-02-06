@@ -83,16 +83,28 @@ mjx_env.close()
 python scripts/rollout_random.py --task hug --backend cpu
 python scripts/rollout_random.py --task hug --backend mjx
 python scripts/rollout_random.py --task hug --backend mjx --physics-profile train_fast
+python scripts/rollout_random.py --task handshake --backend cpu --fixed-standing --control-mode arms_only
 python scripts/render_demo.py --task handshake --backend mjx --mode video
 python scripts/benchmark_backends.py --task hug --backend both --horizons 100 1000 10000 --repeats 3
 python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan --mjx-physics-profile train_fast --horizons 1000 10000
 python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-size 256 --horizons 1000 10000
 python scripts/benchmark_backends.py --task hug --backend mjx --mjx-mode scan-batched --mjx-physics-profile train_fast --batch-sweep 64 128 256 512 --horizons 10000 --repeats 3
+python scripts/benchmark_backends.py --task hug --backend cpu --cpu-mode subproc --cpu-num-envs 8 --cpu-physics-profile default --horizons 10000 --repeats 3
+python scripts/train_ippo.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --physics-profile default --total-steps 500000 --rollout-steps 1024 --ppo-epochs 8 --minibatch-size 256
 ```
 
 `MJXHumanoidCollabEnv` runs step logic fully on-device (MJX physics + JAX obs/reward/success/contact proxy). CPU sync is only used for rendering and `state()`.
 
 Available physics profiles: `default`, `balanced`, `train_fast`.
+Control modes: `all`, `arms_only`.
+
+CPU parallelization:
+- `SubprocHumanoidCollabVecEnv` in `humanoid_collab/vector_env.py` runs many CPU env instances in subprocesses.
+- Use `--cpu-mode subproc --cpu-num-envs N` in `scripts/benchmark_backends.py` to measure multi-env CPU throughput.
+
+IPPO training:
+- `scripts/train_ippo.py` trains two independent PPO policies (`h0`, `h1`) on this environment.
+- For fixed-standing handshake arm training, use `--task handshake --fixed-standing --control-mode arms_only`.
 
 ## Environment API
 

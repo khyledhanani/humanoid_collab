@@ -1,6 +1,6 @@
 """Programmatic MJCF XML generation for the humanoid collaboration environment."""
 
-from typing import Dict
+from typing import Dict, Optional
 
 
 _PHYSICS_PROFILES: Dict[str, Dict[str, str]] = {
@@ -39,7 +39,12 @@ def available_physics_profiles():
     return sorted(_PHYSICS_PROFILES.keys())
 
 
-def _humanoid_body(prefix: str, pos: str, material: str) -> str:
+def _humanoid_body(
+    prefix: str,
+    pos: str,
+    material: str,
+    quat: Optional[str] = None,
+) -> str:
     """Generate the XML for one humanoid body.
 
     Args:
@@ -50,8 +55,9 @@ def _humanoid_body(prefix: str, pos: str, material: str) -> str:
     Returns:
         XML string for the humanoid body
     """
+    quat_attr = f' quat="{quat}"' if quat is not None else ""
     return f"""
-    <body name="{prefix}_torso" pos="{pos}">
+    <body name="{prefix}_torso" pos="{pos}"{quat_attr}>
       <camera name="{prefix}_track" mode="trackcom" pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
       <freejoint name="{prefix}_root"/>
 
@@ -174,10 +180,22 @@ def _humanoid_actuators(prefix: str) -> str:
     <motor name="{prefix}_right_elbow" joint="{prefix}_right_elbow" gear="25" ctrlrange="-1 1"/>"""
 
 
+def _fixed_standing_equality() -> str:
+    """Constraint block that welds both torsos to world."""
+    return """
+  <equality>
+    <weld body1="h0_torso" body2="world"/>
+    <weld body1="h1_torso" body2="world"/>
+  </equality>"""
+
+
 def build_mjcf(
     task_worldbody_additions: str = "",
     task_actuator_additions: str = "",
     physics_profile: str = "default",
+    fixed_standing: bool = False,
+    spawn_half_distance: float = 1.0,
+    h1_faces_h0: bool = False,
 ) -> str:
     """Build the complete MJCF XML with two humanoids and optional task-specific additions.
 
@@ -185,6 +203,9 @@ def build_mjcf(
         task_worldbody_additions: XML fragment to inject into <worldbody> (e.g., a box body).
         task_actuator_additions: XML fragment to inject into <actuator> (e.g., extra actuators).
         physics_profile: Physics option profile name.
+        fixed_standing: If True, add weld constraints to keep torsos fixed to world.
+        spawn_half_distance: Spawn offset magnitude from origin for each humanoid torso.
+        h1_faces_h0: If True, initialize h1 facing opposite direction.
 
     Returns:
         Complete MJCF XML string.
@@ -197,10 +218,14 @@ def build_mjcf(
 
     physics = _PHYSICS_PROFILES[physics_profile]
 
-    h0_body = _humanoid_body("h0", "-1.0 0 1.4", "h0_mat")
-    h1_body = _humanoid_body("h1", "1.0 0 1.4", "h1_mat")
+    h0_pos = f"{-float(spawn_half_distance)} 0 1.4"
+    h1_pos = f"{float(spawn_half_distance)} 0 1.4"
+    h0_body = _humanoid_body("h0", h0_pos, "h0_mat")
+    h1_quat = "0 0 0 1" if h1_faces_h0 else None
+    h1_body = _humanoid_body("h1", h1_pos, "h1_mat", quat=h1_quat)
     h0_actuators = _humanoid_actuators("h0")
     h1_actuators = _humanoid_actuators("h1")
+    equality_block = _fixed_standing_equality() if fixed_standing else ""
 
     xml = f"""<mujoco model="humanoid_collab">
   <compiler angle="degree" inertiafromgeom="true"/>
@@ -236,6 +261,8 @@ def build_mjcf(
     <!-- Task-specific additions -->
 {task_worldbody_additions}
   </worldbody>
+
+{equality_block}
 
   <actuator>
     <!-- Humanoid 0 actuators -->

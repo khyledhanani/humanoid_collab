@@ -17,6 +17,7 @@ import numpy as np
 
 from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
+from humanoid_collab.vector_env import SubprocHumanoidCollabVecEnv
 
 try:
     from humanoid_collab import MJXHumanoidCollabEnv
@@ -51,6 +52,8 @@ def _benchmark_backend_step_loop(
     task: str,
     frame_skip: int,
     physics_profile: str,
+    fixed_standing: bool,
+    control_mode: str,
     horizons: List[int],
     repeats: int,
     warmup_steps: int,
@@ -62,6 +65,8 @@ def _benchmark_backend_step_loop(
         horizon=max(horizons) + warmup_steps + 1000,
         frame_skip=frame_skip,
         physics_profile=physics_profile,
+        fixed_standing=fixed_standing,
+        control_mode=control_mode,
     )
     env.reset(seed=seed)
     act_dim = int(env.action_space("h0").shape[0])
@@ -99,6 +104,85 @@ def _benchmark_backend_step_loop(
         "compile_s": compile_s,
         "horizons": horizon_summary,
         "effective_multiplier": 1.0,
+    }
+
+
+def _run_steps_subproc(
+    vec_env: SubprocHumanoidCollabVecEnv,
+    steps: int,
+    rng: np.random.RandomState,
+    act_dim: int,
+) -> float:
+    t0 = time.perf_counter()
+    num_envs = vec_env.num_envs
+    for _ in range(steps):
+        actions = {
+            "h0": rng.uniform(-1.0, 1.0, size=(num_envs, act_dim)).astype(np.float32),
+            "h1": rng.uniform(-1.0, 1.0, size=(num_envs, act_dim)).astype(np.float32),
+        }
+        vec_env.step(actions)
+    return time.perf_counter() - t0
+
+
+def _benchmark_cpu_subproc(
+    task: str,
+    frame_skip: int,
+    physics_profile: str,
+    fixed_standing: bool,
+    control_mode: str,
+    num_envs: int,
+    horizons: List[int],
+    repeats: int,
+    seed: int,
+    start_method: str,
+) -> Dict[str, object]:
+    env_kwargs = {
+        "task": task,
+        "horizon": max(horizons) + 1000,
+        "frame_skip": frame_skip,
+        "physics_profile": physics_profile,
+        "fixed_standing": fixed_standing,
+        "control_mode": control_mode,
+    }
+    vec_env = SubprocHumanoidCollabVecEnv(
+        num_envs=num_envs,
+        env_kwargs=env_kwargs,
+        auto_reset=True,
+        start_method=start_method,
+    )
+    vec_env.reset(seed=seed)
+    act_dim = int(vec_env.action_space("h0").shape[0])
+
+    horizon_times: Dict[int, List[float]] = {h: [] for h in horizons}
+    for repeat in range(repeats):
+        rng = np.random.RandomState(seed + repeat + 1)
+        for horizon in horizons:
+            vec_env.reset(seed=seed + repeat + horizon)
+            dt = _run_steps_subproc(vec_env, horizon, rng, act_dim)
+            horizon_times[horizon].append(dt)
+
+    vec_env.close()
+
+    horizon_summary = {}
+    multiplier = float(num_envs)
+    for horizon, dts in horizon_times.items():
+        mean_s = statistics.fmean(dts)
+        stdev_s = statistics.pstdev(dts) if len(dts) > 1 else 0.0
+        effective_steps = float(horizon) * multiplier
+        horizon_summary[horizon] = {
+            "mean_s": mean_s,
+            "stdev_s": stdev_s,
+            "steps_per_s": effective_steps / mean_s if mean_s > 0 else 0.0,
+            "effective_steps": effective_steps,
+        }
+
+    return {
+        "backend": "cpu-subproc",
+        "compile_s": None,
+        "horizons": horizon_summary,
+        "effective_multiplier": multiplier,
+        "num_envs": num_envs,
+        "start_method": start_method,
     }
 
 
@@ -145,6 +229,8 @@ def _benchmark_mjx_scan(
     task: str,
     frame_skip: int,
     physics_profile: str,
+    fixed_standing: bool,
+    control_mode: str,
     horizons: List[int],
     repeats: int,
     warmup_steps: int,
@@ -160,6 +246,8 @@ def _benchmark_mjx_scan(
         horizon=max(horizons) + warmup_steps + 1000,
         frame_skip=frame_skip,
         physics_profile=physics_profile,
+        fixed_standing=fixed_standing,
+        control_mode=control_mode,
         detailed_info=False,
     )
     env.reset(seed=seed)
@@ -272,12 +360,18 @@ def _print_results(results: Dict[str, object]) -> None:
     compile_s = results.get("compile_s")
     horizons: Dict[int, Dict[str, float]] = results["horizons"]  # type: ignore[assignment]
     batch_size = int(results.get("batch_size", 1))
+    num_envs = int(results.get("num_envs", 1))
+    start_method = str(results.get("start_method", ""))
 
     print(f"\n[{backend.upper()}]")
     if compile_s is not None:
         print(f"compile+first_step: {compile_s:.4f}s")
     if batch_size > 1:
         print(f"batch_size: {batch_size}")
+    if num_envs > 1:
+        print(f"num_envs: {num_envs}")
+    if start_method:
+        print(f"start_method: {start_method}")
     for h in sorted(horizons.keys()):
         row = horizons[h]
         print(
@@ -332,11 +426,43 @@ def parse_args() -> argparse.Namespace:
         help="Physics profile for CPU backend.",
     )
     parser.add_argument(
+        "--cpu-mode",
+        type=str,
+        default="single",
+        choices=["single", "subproc"],
+        help="CPU benchmark mode.",
+    )
+    parser.add_argument(
+        "--cpu-num-envs",
+        type=int,
+        default=8,
+        help="Number of subprocess envs for --cpu-mode subproc.",
+    )
+    parser.add_argument(
+        "--cpu-start-method",
+        type=str,
+        default="forkserver",
+        choices=["fork", "forkserver", "spawn"],
+        help="Multiprocessing start method for subprocess CPU mode.",
+    )
+    parser.add_argument(
         "--mjx-physics-profile",
         type=str,
         default="train_fast",
         choices=physics_profiles,
         help="Physics profile for MJX backend.",
+    )
+    parser.add_argument(
+        "--fixed-standing",
+        action="store_true",
+        help="Weld torsos to world (disable locomotion).",
+    )
+    parser.add_argument(
+        "--control-mode",
+        type=str,
+        default="all",
+        choices=["all", "arms_only"],
+        help="Actuator subset controlled by RL.",
     )
     return parser.parse_args()
 
@@ -352,17 +478,33 @@ def main() -> None:
     mjx_results = None
 
     if run_cpu:
-        cpu_results = _benchmark_backend_step_loop(
-            env_cls=HumanoidCollabEnv,
-            backend_name="cpu",
-            task=args.task,
-            frame_skip=args.frame_skip,
-            physics_profile=args.cpu_physics_profile,
-            horizons=horizons,
-            repeats=args.repeats,
-            warmup_steps=0,
-            seed=args.seed,
-        )
+        if args.cpu_mode == "single":
+            cpu_results = _benchmark_backend_step_loop(
+                env_cls=HumanoidCollabEnv,
+                backend_name="cpu",
+                task=args.task,
+                frame_skip=args.frame_skip,
+                physics_profile=args.cpu_physics_profile,
+                fixed_standing=args.fixed_standing,
+                control_mode=args.control_mode,
+                horizons=horizons,
+                repeats=args.repeats,
+                warmup_steps=0,
+                seed=args.seed,
+            )
+        else:
+            cpu_results = _benchmark_cpu_subproc(
+                task=args.task,
+                frame_skip=args.frame_skip,
+                physics_profile=args.cpu_physics_profile,
+                fixed_standing=args.fixed_standing,
+                control_mode=args.control_mode,
+                num_envs=args.cpu_num_envs,
+                horizons=horizons,
+                repeats=args.repeats,
+                seed=args.seed,
+                start_method=args.cpu_start_method,
+            )
         _print_results(cpu_results)
 
     if run_mjx:
@@ -378,6 +520,8 @@ def main() -> None:
                     task=args.task,
                     frame_skip=args.frame_skip,
                     physics_profile=args.mjx_physics_profile,
+                    fixed_standing=args.fixed_standing,
+                    control_mode=args.control_mode,
                     horizons=horizons,
                     repeats=args.repeats,
                     warmup_steps=args.warmup_steps,
@@ -388,6 +532,8 @@ def main() -> None:
                     task=args.task,
                     frame_skip=args.frame_skip,
                     physics_profile=args.mjx_physics_profile,
+                    fixed_standing=args.fixed_standing,
+                    control_mode=args.control_mode,
                     horizons=horizons,
                     repeats=args.repeats,
                     warmup_steps=args.warmup_steps,
@@ -406,6 +552,8 @@ def main() -> None:
                             task=args.task,
                             frame_skip=args.frame_skip,
                             physics_profile=args.mjx_physics_profile,
+                            fixed_standing=args.fixed_standing,
+                            control_mode=args.control_mode,
                             horizons=horizons,
                             repeats=args.repeats,
                             warmup_steps=args.warmup_steps,
@@ -432,6 +580,8 @@ def main() -> None:
                         task=args.task,
                         frame_skip=args.frame_skip,
                         physics_profile=args.mjx_physics_profile,
+                        fixed_standing=args.fixed_standing,
+                        control_mode=args.control_mode,
                         horizons=horizons,
                         repeats=args.repeats,
                         warmup_steps=args.warmup_steps,

@@ -8,19 +8,31 @@ from humanoid_collab.mjx_env import MJXHumanoidCollabEnv
 from humanoid_collab.tasks.registry import available_tasks
 
 
-def _make_env(task: str, stage: int, backend: str, render_mode: str, physics_profile: str):
+def _make_env(
+    task: str,
+    stage: int,
+    backend: str,
+    render_mode: str,
+    physics_profile: str,
+    fixed_standing: bool,
+    control_mode: str,
+):
     if backend == "mjx":
         return MJXHumanoidCollabEnv(
             task=task,
             render_mode=render_mode,
             stage=stage,
             physics_profile=physics_profile,
+            fixed_standing=fixed_standing,
+            control_mode=control_mode,
         )
     return HumanoidCollabEnv(
         task=task,
         render_mode=render_mode,
         stage=stage,
         physics_profile=physics_profile,
+        fixed_standing=fixed_standing,
+        control_mode=control_mode,
     )
 
 
@@ -30,17 +42,28 @@ def render_human(
     max_steps: int = 500,
     backend: str = "cpu",
     physics_profile: str = "default",
+    fixed_standing: bool = False,
+    control_mode: str = "all",
 ):
     """Render with interactive viewer (requires mjpython on macOS).
 
     Auto-resets on episode termination so you can watch continuously.
     """
-    env = _make_env(task, stage, backend, "human", physics_profile)
+    env = _make_env(
+        task,
+        stage,
+        backend,
+        "human",
+        physics_profile,
+        fixed_standing,
+        control_mode,
+    )
     obs, infos = env.reset(seed=42)
 
     print(
         f"Rendering task '{task}' (stage {stage}, backend={backend}, "
-        f"physics_profile={physics_profile}). Close the viewer to stop."
+        f"physics_profile={physics_profile}, fixed_standing={fixed_standing}, "
+        f"control_mode={control_mode}). Close the viewer to stop."
     )
     print(f"Auto-resets on fall/termination. Will run for {max_steps} total steps.")
 
@@ -66,6 +89,8 @@ def render_video(
     output: str = "demo.mp4",
     backend: str = "cpu",
     physics_profile: str = "default",
+    fixed_standing: bool = False,
+    control_mode: str = "all",
 ):
     """Save a video of the demo."""
     try:
@@ -74,7 +99,15 @@ def render_video(
         print("imageio required for video mode: pip install imageio imageio-ffmpeg")
         return
 
-    env = _make_env(task, stage, backend, "rgb_array", physics_profile)
+    env = _make_env(
+        task,
+        stage,
+        backend,
+        "rgb_array",
+        physics_profile,
+        fixed_standing,
+        control_mode,
+    )
     obs, infos = env.reset(seed=42)
 
     frames = []
@@ -115,6 +148,18 @@ def main():
         choices=available_physics_profiles(),
         help="MuJoCo physics profile.",
     )
+    parser.add_argument(
+        "--fixed-standing",
+        action="store_true",
+        help="Weld torsos to world to disable locomotion.",
+    )
+    parser.add_argument(
+        "--control-mode",
+        type=str,
+        default="all",
+        choices=["all", "arms_only"],
+        help="Actuator subset controlled by RL.",
+    )
     parser.add_argument("--mode", type=str, default="video",
                         choices=["human", "video"],
                         help="Rendering mode")
@@ -130,6 +175,8 @@ def main():
             args.steps,
             args.backend,
             args.physics_profile,
+            args.fixed_standing,
+            args.control_mode,
         )
     else:
         render_video(
@@ -139,6 +186,8 @@ def main():
             args.output,
             args.backend,
             args.physics_profile,
+            args.fixed_standing,
+            args.control_mode,
         )
 
 

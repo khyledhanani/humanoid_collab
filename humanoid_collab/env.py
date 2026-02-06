@@ -1,6 +1,6 @@
 """PettingZoo Parallel environment for two-agent humanoid collaboration."""
 
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import functools
 
 import numpy as np
@@ -31,6 +31,8 @@ class HumanoidCollabEnv(ParallelEnv):
         hold_target: Consecutive success-condition steps for completion
         stage: Curriculum stage
         physics_profile: MuJoCo physics profile ("default", "balanced", "train_fast")
+        fixed_standing: If True, weld both torsos to world (no locomotion).
+        control_mode: "all" (18 actuators) or "arms_only" (6 arm actuators).
     """
 
     metadata = {
@@ -48,6 +50,8 @@ class HumanoidCollabEnv(ParallelEnv):
         hold_target: int = 30,
         stage: int = 0,
         physics_profile: str = "default",
+        fixed_standing: bool = False,
+        control_mode: str = "all",
     ):
         super().__init__()
 
@@ -58,16 +62,28 @@ class HumanoidCollabEnv(ParallelEnv):
         self.hold_target = hold_target
         self.stage = stage
         self.physics_profile = physics_profile
+        self.fixed_standing = bool(fixed_standing)
+        self.control_mode = str(control_mode)
+        if self.control_mode not in {"all", "arms_only"}:
+            raise ValueError(
+                f"Unknown control_mode '{self.control_mode}'. "
+                "Expected one of: all, arms_only."
+            )
 
         # Get task configuration
         self.task_config = get_task(task)
         self.task_config.set_stage(stage)
+
+        spawn_half_distance, h1_faces_h0 = self._resolve_spawn_setup()
 
         # Build MJCF with task additions
         xml_str = build_mjcf(
             task_worldbody_additions=self.task_config.mjcf_worldbody_additions(),
             task_actuator_additions=self.task_config.mjcf_actuator_additions(),
             physics_profile=self.physics_profile,
+            fixed_standing=self.fixed_standing,
+            spawn_half_distance=spawn_half_distance,
+            h1_faces_h0=h1_faces_h0,
         )
 
         # Compile MuJoCo model
@@ -97,8 +113,11 @@ class HumanoidCollabEnv(ParallelEnv):
         self.agents = ["h0", "h1"]
         self.possible_agents = self.agents.copy()
 
+        # Control indices
+        self._control_actuator_idx = self._build_control_actuator_indices()
+
         # Dimensions
-        self._action_dim = self.id_cache.get_num_actuators("h0")
+        self._action_dim = len(self._control_actuator_idx["h0"])
         self._obs_dim = self.obs_builder.get_obs_dim()
 
         # Episode state
@@ -149,6 +168,8 @@ class HumanoidCollabEnv(ParallelEnv):
 
         # Task-specific initial state randomization
         self.task_config.randomize_state(self.model, self.data, self.id_cache, self._rng)
+        if self.fixed_standing:
+            self._enforce_fixed_standing_roots()
 
         # Forward to compute derived quantities
         mujoco.mj_forward(self.model, self.data)
@@ -179,6 +200,8 @@ class HumanoidCollabEnv(ParallelEnv):
                 "task": self.task_name,
                 "stage": self.stage,
                 "physics_profile": self.physics_profile,
+                "fixed_standing": self.fixed_standing,
+                "control_mode": self.control_mode,
                 "weights": self.task_config.get_weights_dict(),
             }
             for agent in self.agents
@@ -204,7 +227,7 @@ class HumanoidCollabEnv(ParallelEnv):
         for agent in self.agents:
             if agent in actions:
                 action = np.clip(actions[agent], -1.0, 1.0)
-                idx = self.id_cache.actuator_idx[agent]
+                idx = self._control_actuator_idx[agent]
                 ctrl[idx] = action
         self.data.ctrl[:] = ctrl
 
@@ -279,6 +302,8 @@ class HumanoidCollabEnv(ParallelEnv):
                 "task": self.task_name,
                 "stage": self.stage,
                 "physics_profile": self.physics_profile,
+                "fixed_standing": self.fixed_standing,
+                "control_mode": self.control_mode,
                 **reward_info,
                 **success_info,
                 **{k: v for k, v in contact_info.items()},
@@ -372,6 +397,61 @@ class HumanoidCollabEnv(ParallelEnv):
 
     def state(self) -> np.ndarray:
         return np.concatenate([self.data.qpos.copy(), self.data.qvel.copy()])
+
+    def _resolve_spawn_setup(self) -> Tuple[float, bool]:
+        """Select initial spawn layout."""
+        if not self.fixed_standing:
+            return 1.0, False
+        # For fixed-standing hand-only training, keep agents within reach and facing each other.
+        if self.task_name == "handshake":
+            return 0.4, True
+        if self.task_name == "hug":
+            return 0.35, True
+        return 0.9, True
+
+    def _build_control_actuator_indices(self) -> Dict[str, np.ndarray]:
+        """Map each agent to the actuator indices controlled by RL."""
+        control_idx: Dict[str, np.ndarray] = {}
+        for agent in self.possible_agents:
+            idx: List[int] = []
+            for i in range(self.model.nu):
+                act_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+                if act_name is None or not act_name.startswith(f"{agent}_"):
+                    continue
+                if self.control_mode == "all":
+                    idx.append(i)
+                    continue
+                if self._is_arm_actuator_name(act_name):
+                    idx.append(i)
+            if len(idx) == 0:
+                raise ValueError(
+                    f"No actuators selected for agent '{agent}' under "
+                    f"control_mode='{self.control_mode}'."
+                )
+            control_idx[agent] = np.asarray(idx, dtype=np.int32)
+        if len(control_idx["h0"]) != len(control_idx["h1"]):
+            raise ValueError("Control actuator dim mismatch between h0 and h1.")
+        return control_idx
+
+    @staticmethod
+    def _is_arm_actuator_name(act_name: str) -> bool:
+        arm_tokens = (
+            "_left_shoulder1",
+            "_left_shoulder2",
+            "_left_elbow",
+            "_right_shoulder1",
+            "_right_shoulder2",
+            "_right_elbow",
+        )
+        return any(token in act_name for token in arm_tokens)
+
+    def _enforce_fixed_standing_roots(self) -> None:
+        """Pin root state to model initial state for fixed-standing setups."""
+        for agent in self.possible_agents:
+            qpos_idx = self.id_cache.joint_qpos_idx[agent]
+            qvel_idx = self.id_cache.joint_qvel_idx[agent]
+            self.data.qpos[qpos_idx[0:7]] = self.model.qpos0[qpos_idx[0:7]]
+            self.data.qvel[qvel_idx[0:6]] = 0.0
 
     @property
     def max_num_agents(self) -> int:
