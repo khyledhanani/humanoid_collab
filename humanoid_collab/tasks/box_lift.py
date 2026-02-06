@@ -8,11 +8,8 @@ from humanoid_collab.tasks.base import TaskConfig
 from humanoid_collab.tasks.registry import register_task
 from humanoid_collab.utils.ids import IDCache
 from humanoid_collab.utils.kinematics import (
-    get_forward_vector,
     get_up_vector,
-    rotate_to_local_frame,
     compute_tilt_angle,
-    get_root_linear_velocity,
 )
 
 
@@ -128,39 +125,10 @@ class BoxLiftTask(TaskConfig):
 
     @property
     def task_obs_dim(self) -> int:
-        # box_center_local(3) + box_height(1) + l_hand_box(1) + r_hand_box(1) +
-        # partner_hand_box(1) + box_vel_mag(1) = 8
-        return 8
+        return 0
 
     def compute_task_obs(self, data, id_cache, agent, contact_info):
-        partner = "h1" if agent == "h0" else "h0"
-
-        # Box center position in agent's local frame
-        self_xpos = id_cache.get_torso_xpos(data, agent)
-        self_xmat = id_cache.get_torso_xmat(data, agent)
-        box_pos = id_cache.get_site_xpos(data, "box_center")
-        rel_box = box_pos - self_xpos
-        rel_box_local = rotate_to_local_frame(rel_box, self_xmat)
-
-        # Box height
-        box_height = box_pos[2]
-
-        # Hand-box contacts
-        l_hand_box = float(contact_info.get(f"{agent}_l_hand_box", False))
-        r_hand_box = float(contact_info.get(f"{agent}_r_hand_box", False))
-        partner_hand_box = float(contact_info.get(f"{partner}_hand_box", False))
-
-        # Box velocity magnitude
-        # Find box body velocity from qvel
-        box_vel_mag = self._get_box_velocity_mag(data, id_cache)
-
-        return np.array([
-            rel_box_local[0], rel_box_local[1], rel_box_local[2],
-            box_height,
-            l_hand_box, r_hand_box,
-            partner_hand_box,
-            box_vel_mag,
-        ], dtype=np.float32)
+        return np.zeros((0,), dtype=np.float32)
 
     def _get_box_velocity_mag(self, data, id_cache):
         """Get box velocity magnitude from its freejoint qvel."""

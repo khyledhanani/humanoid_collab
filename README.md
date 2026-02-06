@@ -74,6 +74,8 @@ python scripts/benchmark_backends.py --task hug --mode both --horizons 100 1000 
 python scripts/benchmark_backends.py --task hug --mode subproc --num-envs 8 --horizons 10000 --repeats 3
 python scripts/train_ippo.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --physics-profile default --total-steps 500000 --rollout-steps 1024 --ppo-epochs 8 --minibatch-size 256
 python scripts/render_ippo.py --checkpoint checkpoints/ippo_handshake_fixed_arms/ippo_update_000100.pt --episodes 3 --deterministic
+python scripts/train_maddpg.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --stage 1 --num-envs 8 --total-steps 800000 --device cuda
+python scripts/render_maddpg.py --checkpoint checkpoints/maddpg_handshake_fixed_arms/maddpg_step_0800000.pt --episodes 3
 ```
 
 Available physics profiles: `default`, `balanced`, `train_fast`.
@@ -88,13 +90,23 @@ IPPO training:
 - For fixed-standing handshake arm training, use `--task handshake --fixed-standing --control-mode arms_only`.
 - Auto-curriculum is available via `--auto-curriculum`.
 
+MADDPG training:
+- `scripts/train_maddpg.py` trains two deterministic policies with centralized critics (CTDE).
+- Actors only consume each agent's local observation; critics consume joint observations/actions during training.
+- Use GPU for model updates via `--device cuda` (env simulation remains CPU MuJoCo).
+
 ## Environment API
 
 The environment implements PettingZoo's `ParallelEnv` with two agents (`h0`, `h1`).
 
-- **Observation space**: `Box(low=-inf, high=inf, shape=(obs_dim,), dtype=float32)`
-  - Base obs (~58 dims): proprioception + partner relative features
-  - Task-specific obs: 3 for hug, 5 for handshake, 8 for box_lift
+- **Observation space**:
+  - `observation_mode="proprio"`: `Box(low=-inf, high=inf, shape=(47,), dtype=float32)`
+    - Self-only egocentric proprioception (no partner/object state in vector obs)
+    - Task-specific vector obs currently disabled (`task_obs_dim = 0` for all tasks)
+  - `observation_mode="rgb"`: `Box(low=0, high=255, shape=(H, W, 3), dtype=uint8)`
+    - Per-agent egocentric front camera (`h0_ego`, `h1_ego`)
+  - `observation_mode="gray"`: `Box(low=0, high=255, shape=(H, W, 1), dtype=uint8)`
+    - Grayscale egocentric camera observations
 - **Action space**: `Box(low=-1, high=1, shape=(18,), dtype=float32)` by default
   - In `control_mode="arms_only"`, action dim is 6 per agent
 - **Reward**: Cooperative (same scalar for both agents)
@@ -112,7 +124,26 @@ HumanoidCollabEnv(
     physics_profile="default",
     fixed_standing=False,
     control_mode="all",
+    observation_mode="proprio",  # "proprio", "rgb", or "gray"
+    obs_rgb_width=84,            # used when observation_mode is rgb/gray
+    obs_rgb_height=84,           # used when observation_mode is rgb/gray
 )
+```
+
+Example RGB mode:
+
+```python
+env = HumanoidCollabEnv(task="handshake", observation_mode="rgb", obs_rgb_width=96, obs_rgb_height=96)
+obs, infos = env.reset(seed=42)
+print(obs["h0"].shape)  # (96, 96, 3)
+```
+
+Example grayscale mode:
+
+```python
+env = HumanoidCollabEnv(task="handshake", observation_mode="gray", obs_rgb_width=96, obs_rgb_height=96)
+obs, infos = env.reset(seed=42)
+print(obs["h0"].shape)  # (96, 96, 1)
 ```
 
 ### Reset options

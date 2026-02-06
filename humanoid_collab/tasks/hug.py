@@ -92,14 +92,10 @@ class HugTask(TaskConfig):
 
     @property
     def task_obs_dim(self) -> int:
-        return 3  # l_arm_contact, r_arm_contact, partner_arm_contact
+        return 0
 
     def compute_task_obs(self, data, id_cache, agent, contact_info):
-        partner = "h1" if agent == "h0" else "h0"
-        l_arm = float(contact_info.get(f"{agent}_l_arm_{partner}_torso", False))
-        r_arm = float(contact_info.get(f"{agent}_r_arm_{partner}_torso", False))
-        partner_arm = float(contact_info.get(f"{partner}_arm_{agent}_torso", False))
-        return np.array([l_arm, r_arm, partner_arm], dtype=np.float32)
+        return np.zeros((0,), dtype=np.float32)
 
     def compute_reward(self, data, id_cache, contact_info, ctrl,
                        contact_force_proxy, hold_steps, success, fallen):

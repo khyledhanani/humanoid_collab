@@ -10,7 +10,6 @@ from humanoid_collab.utils.ids import IDCache
 from humanoid_collab.utils.kinematics import (
     get_forward_vector,
     get_up_vector,
-    rotate_to_local_frame,
     compute_facing_alignment,
     compute_tilt_angle,
     get_root_linear_velocity,
@@ -90,33 +89,10 @@ class HandshakeTask(TaskConfig):
 
     @property
     def task_obs_dim(self) -> int:
-        # Partner right hand in local frame (3) + hand contact (1) + partner hand contact (1)
-        return 5
+        return 0
 
     def compute_task_obs(self, data, id_cache, agent, contact_info):
-        partner = "h1" if agent == "h0" else "h0"
-
-        # Partner right hand position in agent's local frame
-        self_xpos = id_cache.get_torso_xpos(data, agent)
-        self_xmat = id_cache.get_torso_xmat(data, agent)
-        partner_rhand = id_cache.get_site_xpos(data, f"{partner}_rhand")
-        rel_rhand = partner_rhand - self_xpos
-        rel_rhand_local = rotate_to_local_frame(rel_rhand, self_xmat)
-
-        # Hand-to-hand contact
-        any_contact = float(contact_info.get("h0_hand_h1_hand", False))
-
-        # This agent's right hand touching partner's right hand
-        if agent == "h0":
-            my_r_partner_r = float(contact_info.get("h0_r_hand_h1_r_hand", False))
-        else:
-            my_r_partner_r = float(contact_info.get("h0_r_hand_h1_r_hand", False))
-
-        return np.array([
-            rel_rhand_local[0], rel_rhand_local[1], rel_rhand_local[2],
-            any_contact,
-            my_r_partner_r,
-        ], dtype=np.float32)
+        return np.zeros((0,), dtype=np.float32)
 
     def compute_reward(self, data, id_cache, contact_info, ctrl,
                        contact_force_proxy, hold_steps, success, fallen):

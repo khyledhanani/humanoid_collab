@@ -59,6 +59,7 @@ def _humanoid_body(
     return f"""
     <body name="{prefix}_torso" pos="{pos}"{quat_attr}>
       <camera name="{prefix}_track" mode="trackcom" pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
+      <camera name="{prefix}_ego" mode="fixed" pos="0 0 0.22" xyaxes="0 -1 0 0 0 1" fovy="80"/>
       <freejoint name="{prefix}_root"/>
 
       <geom name="{prefix}_torso_geom" fromto="0 -0.07 0 0 0.07 0" size="0.07" type="capsule" material="{material}"/>

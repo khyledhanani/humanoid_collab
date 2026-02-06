@@ -33,6 +33,10 @@ class HumanoidCollabEnv(ParallelEnv):
         physics_profile: MuJoCo physics profile ("default", "balanced", "train_fast")
         fixed_standing: If True, weld both torsos to world (no locomotion).
         control_mode: "all" (18 actuators) or "arms_only" (6 arm actuators).
+        observation_mode: "proprio" (vector), "rgb" (egocentric color image),
+            or "gray" (egocentric grayscale image).
+        obs_rgb_width: Visual observation width (used when observation_mode is rgb/gray).
+        obs_rgb_height: Visual observation height (used when observation_mode is rgb/gray).
     """
 
     metadata = {
@@ -52,6 +56,9 @@ class HumanoidCollabEnv(ParallelEnv):
         physics_profile: str = "default",
         fixed_standing: bool = False,
         control_mode: str = "all",
+        observation_mode: str = "proprio",
+        obs_rgb_width: int = 84,
+        obs_rgb_height: int = 84,
     ):
         super().__init__()
 
@@ -64,11 +71,21 @@ class HumanoidCollabEnv(ParallelEnv):
         self.physics_profile = physics_profile
         self.fixed_standing = bool(fixed_standing)
         self.control_mode = str(control_mode)
+        self.observation_mode = str(observation_mode)
+        self.obs_rgb_width = int(obs_rgb_width)
+        self.obs_rgb_height = int(obs_rgb_height)
         if self.control_mode not in {"all", "arms_only"}:
             raise ValueError(
                 f"Unknown control_mode '{self.control_mode}'. "
                 "Expected one of: all, arms_only."
             )
+        if self.observation_mode not in {"proprio", "rgb", "gray"}:
+            raise ValueError(
+                f"Unknown observation_mode '{self.observation_mode}'. "
+                "Expected one of: proprio, rgb, gray."
+            )
+        if self.obs_rgb_width <= 0 or self.obs_rgb_height <= 0:
+            raise ValueError("obs_rgb_width and obs_rgb_height must be positive.")
 
         # Get task configuration
         self.task_config = get_task(task)
@@ -112,6 +129,7 @@ class HumanoidCollabEnv(ParallelEnv):
         # Agent setup
         self.agents = ["h0", "h1"]
         self.possible_agents = self.agents.copy()
+        self._obs_camera_names = {agent: f"{agent}_ego" for agent in self.possible_agents}
 
         # Control indices
         self._control_actuator_idx = self._build_control_actuator_indices()
@@ -119,6 +137,9 @@ class HumanoidCollabEnv(ParallelEnv):
         # Dimensions
         self._action_dim = len(self._control_actuator_idx["h0"])
         self._obs_dim = self.obs_builder.get_obs_dim()
+        if self.observation_mode in {"rgb", "gray"}:
+            self._validate_obs_cameras()
+            self._validate_visual_context_support()
 
         # Episode state
         self._step_count = 0
@@ -130,9 +151,18 @@ class HumanoidCollabEnv(ParallelEnv):
         # Rendering
         self._viewer = None
         self._render_context = None
+        self._obs_renderers: Dict[str, mujoco.Renderer] = {}
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Space:
+        if self.observation_mode in {"rgb", "gray"}:
+            channels = 3 if self.observation_mode == "rgb" else 1
+            return spaces.Box(
+                low=0,
+                high=255,
+                shape=(self.obs_rgb_height, self.obs_rgb_width, channels),
+                dtype=np.uint8,
+            )
         return spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -202,6 +232,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 "physics_profile": self.physics_profile,
                 "fixed_standing": self.fixed_standing,
                 "control_mode": self.control_mode,
+                "observation_mode": self.observation_mode,
                 "weights": self.task_config.get_weights_dict(),
             }
             for agent in self.agents
@@ -304,6 +335,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 "physics_profile": self.physics_profile,
                 "fixed_standing": self.fixed_standing,
                 "control_mode": self.control_mode,
+                "observation_mode": self.observation_mode,
                 **reward_info,
                 **success_info,
                 **{k: v for k, v in contact_info.items()},
@@ -316,6 +348,9 @@ class HumanoidCollabEnv(ParallelEnv):
 
     def _build_full_observations(self, contact_info: Dict[str, bool]) -> Dict[str, np.ndarray]:
         """Build full observations = base obs + task-specific obs."""
+        if self.observation_mode in {"rgb", "gray"}:
+            return self._build_visual_observations()
+
         base_obs = self.obs_builder.build_base_observations(self.data)
 
         observations = {}
@@ -327,7 +362,87 @@ class HumanoidCollabEnv(ParallelEnv):
 
         return observations
 
+    def _build_visual_observations(self) -> Dict[str, np.ndarray]:
+        """Build per-agent egocentric visual observations (RGB or grayscale)."""
+        observations: Dict[str, np.ndarray] = {}
+        for agent in self.possible_agents:
+            renderer = self._obs_renderers.get(agent)
+            if renderer is None:
+                try:
+                    renderer = mujoco.Renderer(self.model, self.obs_rgb_height, self.obs_rgb_width)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Failed to initialize RGB observation renderer. "
+                        "An offscreen OpenGL context is required for observation_mode='rgb'. "
+                        "Try setting MUJOCO_GL=egl (Linux) or running with an active display."
+                    ) from exc
+                self._obs_renderers[agent] = renderer
+            try:
+                renderer.update_scene(self.data, camera=self._obs_camera_names[agent])
+                frame = renderer.render()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to render visual observation frame. "
+                    "Verify OpenGL/offscreen rendering support in this runtime."
+                ) from exc
+            frame_u8 = np.asarray(frame, dtype=np.uint8)
+            if self.observation_mode == "gray":
+                observations[agent] = self._rgb_to_gray(frame_u8)
+            else:
+                observations[agent] = frame_u8
+        return observations
+
+    @staticmethod
+    def _rgb_to_gray(frame_u8: np.ndarray) -> np.ndarray:
+        # ITU-R BT.601 luma transform.
+        gray = (
+            0.299 * frame_u8[..., 0].astype(np.float32)
+            + 0.587 * frame_u8[..., 1].astype(np.float32)
+            + 0.114 * frame_u8[..., 2].astype(np.float32)
+        )
+        gray = np.clip(gray, 0.0, 255.0).astype(np.uint8)
+        return gray[..., None]
+
+    def _validate_obs_cameras(self) -> None:
+        for agent in self.possible_agents:
+            camera_name = self._obs_camera_names[agent]
+            cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+            if cam_id < 0:
+                raise ValueError(
+                    f"Observation camera '{camera_name}' not found in model. "
+                    "Expected egocentric camera for each agent."
+                )
+
+    def _validate_visual_context_support(self) -> None:
+        ctx = None
+        try:
+            ctx = mujoco.GLContext(self.obs_rgb_width, self.obs_rgb_height)
+            if hasattr(ctx, "make_current"):
+                ctx.make_current()
+        except Exception as exc:
+            raise RuntimeError(
+                "Visual observations (rgb/gray) require an offscreen OpenGL context. "
+                "Try setting MUJOCO_GL=egl (Linux) or run with an active display."
+            ) from exc
+        finally:
+            if ctx is not None and hasattr(ctx, "free"):
+                try:
+                    ctx.free()
+                except Exception:
+                    pass
+
     def _get_terminal_returns(self):
+        if self.observation_mode in {"rgb", "gray"}:
+            channels = 3 if self.observation_mode == "rgb" else 1
+            zero = np.zeros((self.obs_rgb_height, self.obs_rgb_width, channels), dtype=np.uint8)
+            obs = {agent: zero.copy() for agent in self.possible_agents}
+            return (
+                obs,
+                {agent: 0.0 for agent in self.possible_agents},
+                {agent: True for agent in self.possible_agents},
+                {agent: self._truncated for agent in self.possible_agents},
+                {agent: {} for agent in self.possible_agents},
+            )
         return (
             {agent: np.zeros(self._obs_dim, dtype=np.float32) for agent in self.possible_agents},
             {agent: 0.0 for agent in self.possible_agents},
@@ -339,6 +454,16 @@ class HumanoidCollabEnv(ParallelEnv):
     def _handle_nan_error(self):
         self._terminated = True
         self.agents = []
+        if self.observation_mode in {"rgb", "gray"}:
+            channels = 3 if self.observation_mode == "rgb" else 1
+            zero = np.zeros((self.obs_rgb_height, self.obs_rgb_width, channels), dtype=np.uint8)
+            return (
+                {agent: zero.copy() for agent in self.possible_agents},
+                {agent: -100.0 for agent in self.possible_agents},
+                {agent: True for agent in self.possible_agents},
+                {agent: False for agent in self.possible_agents},
+                {agent: {"termination_reason": "nan_error"} for agent in self.possible_agents},
+            )
         return (
             {agent: np.zeros(self._obs_dim, dtype=np.float32) for agent in self.possible_agents},
             {agent: -100.0 for agent in self.possible_agents},
@@ -394,6 +519,9 @@ class HumanoidCollabEnv(ParallelEnv):
         if self._render_context is not None:
             self._render_context.close()
             self._render_context = None
+        for renderer in self._obs_renderers.values():
+            renderer.close()
+        self._obs_renderers = {}
 
     def state(self) -> np.ndarray:
         return np.concatenate([self.data.qpos.copy(), self.data.qvel.copy()])

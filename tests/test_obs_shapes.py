@@ -16,6 +16,13 @@ def env(request):
 
 
 class TestObsShape:
+    def test_base_obs_is_self_proprio_only(self, env):
+        h0_qpos = len(env.id_cache.joint_qpos_idx["h0"])
+        h0_qvel = len(env.id_cache.joint_qvel_idx["h0"])
+        expected_base = (h0_qpos - 7) + (h0_qvel - 6) + 4 + 3
+        assert env.obs_builder.get_base_obs_dim() == expected_base
+        assert env.task_config.task_obs_dim == 0
+
     def test_obs_matches_declared_space(self, env):
         obs, _ = env.reset(seed=42)
         for agent in ["h0", "h1"]:

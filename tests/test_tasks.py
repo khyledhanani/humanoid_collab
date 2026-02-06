@@ -26,7 +26,7 @@ class TestTaskRegistry:
 class TestHugTask:
     def test_hug_obs_dim(self):
         config = get_task("hug")
-        assert config.task_obs_dim == 3
+        assert config.task_obs_dim == 0
 
     def test_hug_curriculum_stages(self):
         config = get_task("hug")
@@ -50,7 +50,7 @@ class TestHugTask:
 class TestHandshakeTask:
     def test_handshake_obs_dim(self):
         config = get_task("handshake")
-        assert config.task_obs_dim == 5
+        assert config.task_obs_dim == 0
 
     def test_handshake_curriculum_stages(self):
         config = get_task("handshake")
@@ -73,7 +73,7 @@ class TestHandshakeTask:
 class TestBoxLiftTask:
     def test_box_lift_obs_dim(self):
         config = get_task("box_lift")
-        assert config.task_obs_dim == 8
+        assert config.task_obs_dim == 0
 
     def test_box_lift_curriculum_stages(self):
         config = get_task("box_lift")
@@ -95,9 +95,7 @@ class TestBoxLiftTask:
     def test_box_lift_box_height_in_obs(self):
         env = HumanoidCollabEnv(task="box_lift")
         obs, _ = env.reset(seed=42)
-        # Box height should be part of task obs (at a known offset)
-        # Just verify obs is the right size
-        expected_dim = env.obs_builder.get_base_obs_dim() + 8
+        expected_dim = env.obs_builder.get_base_obs_dim() + env.task_config.task_obs_dim
         assert obs["h0"].shape[0] == expected_dim
         env.close()
 
