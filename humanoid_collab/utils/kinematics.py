@@ -77,20 +77,20 @@ def compute_relative_velocity(vel1: np.ndarray, vel2: np.ndarray) -> np.ndarray:
 
 
 def get_root_quat(data: mujoco.MjData, qpos_idx: np.ndarray) -> np.ndarray:
-    """Extract root quaternion [w, x, y, z] from qpos."""
-    return data.qpos[qpos_idx[3:7]].copy()
+    """Extract root quaternion [w, x, y, z] from qpos (view, no copy)."""
+    return data.qpos[qpos_idx[3:7]]
 
 
 def get_root_position(data: mujoco.MjData, qpos_idx: np.ndarray) -> np.ndarray:
-    """Extract root position [x, y, z] from qpos."""
-    return data.qpos[qpos_idx[0:3]].copy()
+    """Extract root position [x, y, z] from qpos (view, no copy)."""
+    return data.qpos[qpos_idx[0:3]]
 
 
 def get_root_linear_velocity(data: mujoco.MjData, qvel_idx: np.ndarray) -> np.ndarray:
-    """Extract root linear velocity [vx, vy, vz] from qvel."""
-    return data.qvel[qvel_idx[0:3]].copy()
+    """Extract root linear velocity [vx, vy, vz] from qvel (view, no copy)."""
+    return data.qvel[qvel_idx[0:3]]
 
 
 def get_root_angular_velocity(data: mujoco.MjData, qvel_idx: np.ndarray) -> np.ndarray:
-    """Extract root angular velocity [wx, wy, wz] from qvel."""
-    return data.qvel[qvel_idx[3:6]].copy()
+    """Extract root angular velocity [wx, wy, wz] from qvel (view, no copy)."""
+    return data.qvel[qvel_idx[3:6]]

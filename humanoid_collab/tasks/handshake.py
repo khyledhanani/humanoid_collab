@@ -207,8 +207,7 @@ class HandshakeTask(TaskConfig):
         info["h1_speed_xy"] = h1_speed
 
         # Light upright regularization carried through all stages.
-        h0_xmat = id_cache.get_torso_xmat(data, "h0")
-        h1_xmat = id_cache.get_torso_xmat(data, "h1")
+        # Reuse h0_xmat / h1_xmat fetched above for facing reward.
         h0_tilt = compute_tilt_angle(get_up_vector(h0_xmat))
         h1_tilt = compute_tilt_angle(get_up_vector(h1_xmat))
         upright_score = 0.5 * (

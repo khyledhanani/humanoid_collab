@@ -189,34 +189,39 @@ class IDCache:
         return self.geom_groups[name]
 
     def get_site_xpos(self, data: mujoco.MjData, site_name: str) -> np.ndarray:
+        """Return site position as a read-only view (no copy for speed)."""
         site_id = self.site_ids.get(site_name)
         if site_id is None:
             raise ValueError(f"Site '{site_name}' not found in cache")
-        return data.site_xpos[site_id].copy()
+        return data.site_xpos[site_id]
 
     def get_body_xpos(self, data: mujoco.MjData, body_name: str) -> np.ndarray:
+        """Return body position as a read-only view (no copy for speed)."""
         body_id = self.body_ids.get(body_name)
         if body_id is None:
             raise ValueError(f"Body '{body_name}' not found in cache")
-        return data.xpos[body_id].copy()
+        return data.xpos[body_id]
 
     def get_body_xmat(self, data: mujoco.MjData, body_name: str) -> np.ndarray:
+        """Return body rotation matrix as a read-only view (no copy for speed)."""
         body_id = self.body_ids.get(body_name)
         if body_id is None:
             raise ValueError(f"Body '{body_name}' not found in cache")
-        return data.xmat[body_id].reshape(3, 3).copy()
+        return data.xmat[body_id].reshape(3, 3)
 
     def get_torso_xpos(self, data: mujoco.MjData, agent: str) -> np.ndarray:
+        """Return torso position as a read-only view (no copy for speed)."""
         body_id = self.torso_body_ids.get(agent)
         if body_id is None:
             raise ValueError(f"Torso body for agent '{agent}' not found")
-        return data.xpos[body_id].copy()
+        return data.xpos[body_id]
 
     def get_torso_xmat(self, data: mujoco.MjData, agent: str) -> np.ndarray:
+        """Return torso rotation matrix as a read-only view (no copy for speed)."""
         body_id = self.torso_body_ids.get(agent)
         if body_id is None:
             raise ValueError(f"Torso body for agent '{agent}' not found")
-        return data.xmat[body_id].reshape(3, 3).copy()
+        return data.xmat[body_id].reshape(3, 3)
 
     def get_num_actuators(self, agent: str) -> int:
         return len(self.actuator_idx[agent])
