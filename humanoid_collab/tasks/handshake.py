@@ -50,12 +50,17 @@ class HandshakeTask(TaskConfig):
         self._weights = _HANDSHAKE_STAGES[0].copy()
         self._stage = 0
 
-    # The four possible one-hand-to-one-hand pairs
-    HAND_PAIRS = [
-        ("h0_r_hand_h1_r_hand", "h0_rhand", "h1_rhand"),
-        ("h0_r_hand_h1_l_hand", "h0_rhand", "h1_lhand"),
-        ("h0_l_hand_h1_r_hand", "h0_lhand", "h1_rhand"),
-        ("h0_l_hand_h1_l_hand", "h0_lhand", "h1_lhand"),
+    # Right-to-right handshake (the human convention)
+    SHAKE_PAIR_KEY = "h0_r_hand_h1_r_hand"
+    SHAKE_SITE_A = "h0_rhand"
+    SHAKE_SITE_B = "h1_rhand"
+
+    # All hand pairs we monitor (to detect and penalize wrong-hand contacts)
+    ALL_HAND_PAIRS = [
+        "h0_r_hand_h1_r_hand",
+        "h0_r_hand_h1_l_hand",
+        "h0_l_hand_h1_r_hand",
+        "h0_l_hand_h1_l_hand",
     ]
 
     def get_contact_pairs(self) -> List[Tuple[str, str, str]]:
@@ -137,49 +142,43 @@ class HandshakeTask(TaskConfig):
         info["relative_speed"] = rel_speed
         info["r_stability"] = r_stab
 
-        # --- Hand proximity shaping (toward closest opposing hand) ---
-        # Compute distances for all four one-hand-to-one-hand pairs
-        pair_dists = {}
-        for pair_key, site_a, site_b in self.HAND_PAIRS:
-            pos_a = id_cache.get_site_xpos(data, site_a)
-            pos_b = id_cache.get_site_xpos(data, site_b)
-            pair_dists[pair_key] = np.linalg.norm(pos_a - pos_b)
-
-        # Find the closest pair -- let agents discover which one works
-        best_pair = min(pair_dists, key=pair_dists.get)
-        best_dist = pair_dists[best_pair]
+        # --- Hand proximity shaping (right-to-right only) ---
+        h0_rhand = id_cache.get_site_xpos(data, self.SHAKE_SITE_A)
+        h1_rhand = id_cache.get_site_xpos(data, self.SHAKE_SITE_B)
+        hand_dist = np.linalg.norm(h0_rhand - h1_rhand)
 
         if w["w_hand_prox"] > 0:
-            # Softer exponential decay for better gradients at longer distances
-            r_hand = w["w_hand_prox"] * np.exp(-2.0 * best_dist)
+            r_hand = w["w_hand_prox"] * np.exp(-2.0 * hand_dist)
 
             # Anneal hand shaping once contact is achieved
-            if contact_info.get(best_pair, False):
-                r_hand *= 0.3  # Reduce shaping when already in contact
-
+            if contact_info.get(self.SHAKE_PAIR_KEY, False):
+                r_hand *= 0.3
             total += r_hand
             info["r_hand_prox"] = r_hand
         else:
             info["r_hand_prox"] = 0.0
-        info["hand_distance"] = best_dist
-        info["hand_pair_selected"] = best_pair
+        info["hand_distance"] = hand_dist
 
-        # --- Contact reward: exactly one hand pair touching = handshake ---
-        active_pairs = [k for k in pair_dists if contact_info.get(k, False)]
-        num_contacts = len(active_pairs)
-        info["hand_contact_pairs"] = num_contacts
-        info["hand_active_pairs"] = active_pairs
+        # --- Contact reward: right-to-right = reward, wrong pairs = penalty ---
+        correct_contact = contact_info.get(self.SHAKE_PAIR_KEY, False)
+        wrong_pairs = [k for k in self.ALL_HAND_PAIRS
+                       if k != self.SHAKE_PAIR_KEY and contact_info.get(k, False)]
 
-        if num_contacts == 1:
-            # Exactly one hand pair in contact -- proper handshake
+        if correct_contact and not wrong_pairs:
+            # Clean right-to-right handshake
             r_contact = w["w_contact"]
-        elif num_contacts > 1:
-            # Multiple hand pairs touching -- penalize (not a handshake)
+        elif correct_contact and wrong_pairs:
+            # Right-to-right plus extra hands -- partial credit but discourage
+            r_contact = 0.3 * w["w_contact"]
+        elif wrong_pairs:
+            # Wrong hand pair only -- penalize
             r_contact = -0.5 * w["w_contact"]
         else:
             r_contact = 0.0
         total += r_contact
         info["r_contact"] = r_contact
+        info["correct_hand_contact"] = correct_contact
+        info["wrong_hand_pairs"] = len(wrong_pairs)
 
         # Penalties
         r_energy = w["w_energy"] * np.sum(np.square(ctrl))
@@ -223,12 +222,14 @@ class HandshakeTask(TaskConfig):
         info["shake_facing"] = facing
         info["shake_facing_ok"] = facing_ok
 
-        # Exactly one hand pair must be in contact (proper handshake)
-        active_pairs = [pk for pk, _, _ in self.HAND_PAIRS
-                        if contact_info.get(pk, False)]
-        contact_ok = len(active_pairs) == 1
+        # Right-to-right hand contact required (no wrong-hand contacts)
+        correct_contact = contact_info.get(self.SHAKE_PAIR_KEY, False)
+        wrong_pairs = [k for k in self.ALL_HAND_PAIRS
+                       if k != self.SHAKE_PAIR_KEY and contact_info.get(k, False)]
+        contact_ok = correct_contact and not wrong_pairs
         info["shake_contact_ok"] = contact_ok
-        info["shake_active_pairs"] = active_pairs
+        info["shake_correct_contact"] = correct_contact
+        info["shake_wrong_pairs"] = len(wrong_pairs)
 
         h0_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h0"])
         h1_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h1"])
