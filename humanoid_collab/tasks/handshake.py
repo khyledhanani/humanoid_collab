@@ -56,6 +56,7 @@ STOP_ZONE_MIN = 0.6
 STOP_ZONE_MAX = 0.9
 LOCO_FACING_THRESH = 0.4
 LOCO_SPEED_THRESH = 1.1
+RESET_ROOT_Z = 1.0
 
 
 @register_task
@@ -103,7 +104,7 @@ class HandshakeTask(TaskConfig):
         # H0 position & orientation
         data.qpos[h0_qpos[0]] = -half_dist + rng.uniform(-0.1, 0.1)
         data.qpos[h0_qpos[1]] = rng.uniform(-0.1, 0.1)
-        data.qpos[h0_qpos[2]] = 1.4
+        data.qpos[h0_qpos[2]] = RESET_ROOT_Z
         yaw0 = rng.uniform(-0.2, 0.2)
         data.qpos[h0_qpos[3]] = np.cos(yaw0 / 2)
         data.qpos[h0_qpos[4]] = 0.0
@@ -113,7 +114,7 @@ class HandshakeTask(TaskConfig):
         # H1 position & orientation
         data.qpos[h1_qpos[0]] = half_dist + rng.uniform(-0.1, 0.1)
         data.qpos[h1_qpos[1]] = rng.uniform(-0.1, 0.1)
-        data.qpos[h1_qpos[2]] = 1.4
+        data.qpos[h1_qpos[2]] = RESET_ROOT_Z
         yaw1 = np.pi + rng.uniform(-0.2, 0.2)
         data.qpos[h1_qpos[3]] = np.cos(yaw1 / 2)
         data.qpos[h1_qpos[4]] = 0.0
