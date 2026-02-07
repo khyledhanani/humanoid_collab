@@ -11,7 +11,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -31,6 +31,7 @@ from humanoid_collab import (
     SubprocHumanoidCollabVecEnv,
 )
 from humanoid_collab.mjcf_builder import available_physics_profiles
+from humanoid_collab.vision import load_frozen_encoder_from_vae_checkpoint
 from humanoid_collab.utils.exp_logging import ExperimentLogger
 
 
@@ -54,7 +55,9 @@ def parse_args() -> argparse.Namespace:
         help="Weld torsos to world (fixed standing). Use --no-fixed-standing for locomotion.",
     )
     parser.add_argument("--control-mode", type=str, default="arms_only", choices=["all", "arms_only"])
-    parser.add_argument("--observation-mode", type=str, default="proprio", choices=["proprio"])
+    parser.add_argument("--observation-mode", type=str, default="proprio", choices=["proprio", "rgb", "gray"])
+    parser.add_argument("--obs-rgb-width", type=int, default=84)
+    parser.add_argument("--obs-rgb-height", type=int, default=84)
 
     parser.add_argument("--total-steps", type=int, default=800_000, help="Total environment transitions.")
     parser.add_argument("--num-envs", type=int, default=1)
@@ -65,6 +68,7 @@ def parse_args() -> argparse.Namespace:
         choices=["shared_memory", "subproc"],
         help="Vector env backend used when --num-envs > 1.",
     )
+    parser.add_argument("--vec-backend", dest="vec_env_backend", choices=["shared_memory", "subproc"], help=argparse.SUPPRESS)
     parser.add_argument("--start-method", type=str, default=None)
 
     parser.add_argument("--buffer-size", type=int, default=500_000)
@@ -94,6 +98,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--torch-threads", type=int, default=4)
+    parser.add_argument(
+        "--encoder-checkpoint",
+        type=str,
+        default=None,
+        help="Path to pretrained VAE checkpoint for visual observations.",
+    )
+    parser.add_argument(
+        "--vision-use-proprio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Concatenate proprio vectors from infos with visual latents (recommended).",
+    )
+    parser.add_argument(
+        "--replay-obs-dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16"],
+        help="Storage dtype for encoded observations in replay buffer.",
+    )
 
     parser.add_argument("--auto-curriculum", action="store_true", help="Advance stage based on success window.")
     parser.add_argument(
@@ -197,6 +220,7 @@ class ReplayBuffer:
         num_agents: int,
         obs_dim: int,
         act_dim: int,
+        obs_dtype: np.dtype = np.float32,
     ):
         if capacity <= 0:
             raise ValueError("Replay capacity must be > 0")
@@ -204,11 +228,12 @@ class ReplayBuffer:
         self.num_agents = int(num_agents)
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
+        self.obs_dtype = np.dtype(obs_dtype)
 
-        self.obs = np.zeros((self.capacity, self.num_agents, self.obs_dim), dtype=np.float32)
+        self.obs = np.zeros((self.capacity, self.num_agents, self.obs_dim), dtype=self.obs_dtype)
         self.actions = np.zeros((self.capacity, self.num_agents, self.act_dim), dtype=np.float32)
         self.rewards = np.zeros((self.capacity, self.num_agents), dtype=np.float32)
-        self.next_obs = np.zeros((self.capacity, self.num_agents, self.obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((self.capacity, self.num_agents, self.obs_dim), dtype=self.obs_dtype)
         self.dones = np.zeros((self.capacity, 1), dtype=np.float32)
 
         self.ptr = 0
@@ -223,12 +248,14 @@ class ReplayBuffer:
         dones: np.ndarray,
     ) -> None:
         batch_n = int(obs.shape[0])
+        obs_arr = np.asarray(obs, dtype=self.obs_dtype)
+        next_obs_arr = np.asarray(next_obs, dtype=self.obs_dtype)
         for i in range(batch_n):
             idx = self.ptr
-            self.obs[idx] = obs[i]
+            self.obs[idx] = obs_arr[i]
             self.actions[idx] = actions[i]
             self.rewards[idx] = rewards[i]
-            self.next_obs[idx] = next_obs[i]
+            self.next_obs[idx] = next_obs_arr[i]
             self.dones[idx, 0] = float(dones[i, 0])
             self.ptr = (self.ptr + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
@@ -244,6 +271,135 @@ class ReplayBuffer:
             next_obs=torch.as_tensor(self.next_obs[idx], dtype=torch.float32, device=device),
             dones=torch.as_tensor(self.dones[idx], dtype=torch.float32, device=device),
         )
+
+
+@dataclass
+class ObsAdapter:
+    use_visual_encoder: bool
+    use_proprio_with_visual: bool
+    encoder_bundle: Optional[Any]
+    encoder_device: torch.device
+    expected_obs_shape: Optional[Tuple[int, int, int]]
+
+
+def _build_obs_adapter(args: argparse.Namespace, device: torch.device) -> ObsAdapter:
+    if args.observation_mode == "proprio":
+        return ObsAdapter(
+            use_visual_encoder=False,
+            use_proprio_with_visual=False,
+            encoder_bundle=None,
+            encoder_device=device,
+            expected_obs_shape=None,
+        )
+    if args.encoder_checkpoint is None:
+        raise ValueError(
+            "Visual MADDPG requires --encoder-checkpoint pointing to a pretrained VAE."
+        )
+    bundle = load_frozen_encoder_from_vae_checkpoint(args.encoder_checkpoint, device=device)
+    if bundle.observation_mode != args.observation_mode:
+        raise ValueError(
+            f"Encoder observation_mode='{bundle.observation_mode}' does not match "
+            f"--observation-mode '{args.observation_mode}'."
+        )
+    return ObsAdapter(
+        use_visual_encoder=True,
+        use_proprio_with_visual=bool(args.vision_use_proprio),
+        encoder_bundle=bundle,
+        encoder_device=device,
+        expected_obs_shape=bundle.obs_shape,
+    )
+
+
+def _normalize_infos_payload(
+    infos_payload: Any,
+    num_envs: int,
+) -> List[Dict[str, Dict[str, Any]]]:
+    if num_envs == 1 and isinstance(infos_payload, dict):
+        return [infos_payload]
+    if not isinstance(infos_payload, list):
+        raise TypeError(f"Expected list infos payload for num_envs={num_envs}, got {type(infos_payload)}")
+    return infos_payload
+
+
+def _extract_proprio_from_infos(
+    infos_list: List[Dict[str, Dict[str, Any]]],
+    num_envs: int,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+) -> Dict[str, np.ndarray]:
+    if done_mask is None:
+        done_mask = np.zeros((num_envs,), dtype=np.bool_)
+    out: Dict[str, List[np.ndarray]] = {agent: [] for agent in AGENTS}
+    for env_idx in range(num_envs):
+        info_env = infos_list[env_idx]
+        done_flag = bool(done_mask[env_idx])
+        for agent in AGENTS:
+            agent_info = info_env.get(agent, {})
+            info_src = agent_info
+            if use_reset_info_for_done and done_flag:
+                reset_info = agent_info.get("reset_info")
+                if isinstance(reset_info, dict):
+                    info_src = reset_info
+            vec = info_src.get("proprio_obs")
+            if vec is None:
+                raise KeyError(
+                    "Expected 'proprio_obs' in infos for visual training. "
+                    "Ensure env was created with emit_proprio_info=True."
+                )
+            out[agent].append(np.asarray(vec, dtype=np.float32))
+    return {agent: np.stack(out[agent], axis=0).astype(np.float32) for agent in AGENTS}
+
+
+def _encode_visual_batch(
+    raw_obs_batch: Dict[str, np.ndarray],
+    adapter: ObsAdapter,
+) -> Dict[str, np.ndarray]:
+    assert adapter.encoder_bundle is not None
+    expected_shape = adapter.expected_obs_shape
+    latent: Dict[str, np.ndarray] = {}
+    for agent in AGENTS:
+        obs_np = np.asarray(raw_obs_batch[agent])
+        if obs_np.ndim != 4:
+            raise ValueError(
+                f"Expected batched image observations [N,H,W,C] for agent '{agent}', got {obs_np.shape}"
+            )
+        h, w, c = int(obs_np.shape[1]), int(obs_np.shape[2]), int(obs_np.shape[3])
+        if expected_shape is not None and (h, w, c) != expected_shape:
+            raise ValueError(
+                f"Encoder expects observation shape {expected_shape}, got {(h, w, c)} for agent '{agent}'."
+            )
+        x = torch.as_tensor(obs_np, device=adapter.encoder_device, dtype=torch.float32) / 255.0
+        x = x.permute(0, 3, 1, 2).contiguous()
+        with torch.no_grad():
+            z = adapter.encoder_bundle.vae.encode_mean(x)
+        latent[agent] = z.detach().cpu().numpy().astype(np.float32)
+    return latent
+
+
+def _transform_obs_batch(
+    raw_obs_batch: Dict[str, np.ndarray],
+    infos_payload: Any,
+    num_envs: int,
+    adapter: ObsAdapter,
+    done_mask: Optional[np.ndarray] = None,
+    use_reset_info_for_done: bool = False,
+) -> Dict[str, np.ndarray]:
+    if not adapter.use_visual_encoder:
+        return {agent: np.asarray(raw_obs_batch[agent], dtype=np.float32) for agent in AGENTS}
+    infos_list = _normalize_infos_payload(infos_payload, num_envs)
+    latent = _encode_visual_batch(raw_obs_batch, adapter)
+    if not adapter.use_proprio_with_visual:
+        return latent
+    proprio = _extract_proprio_from_infos(
+        infos_list=infos_list,
+        num_envs=num_envs,
+        done_mask=done_mask,
+        use_reset_info_for_done=use_reset_info_for_done,
+    )
+    return {
+        agent: np.concatenate([proprio[agent], latent[agent]], axis=-1).astype(np.float32)
+        for agent in AGENTS
+    }
 
 
 def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
@@ -284,17 +440,20 @@ def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
         fixed_standing=args.fixed_standing,
         control_mode=args.control_mode,
         observation_mode=args.observation_mode,
+        obs_rgb_width=int(args.obs_rgb_width),
+        obs_rgb_height=int(args.obs_rgb_height),
+        emit_proprio_info=bool(args.observation_mode in {"rgb", "gray"} and args.vision_use_proprio),
     )
 
 
 def _format_reset_obs(obs: Dict[str, np.ndarray], num_envs: int) -> Dict[str, np.ndarray]:
     if num_envs == 1:
         return {
-            agent: np.asarray(obs[agent], dtype=np.float32)[None, ...]
+            agent: np.asarray(obs[agent])[None, ...]
             for agent in AGENTS
         }
     return {
-        agent: np.asarray(obs[agent], dtype=np.float32)
+        agent: np.asarray(obs[agent])
         for agent in AGENTS
     }
 
@@ -400,7 +559,7 @@ def _maybe_replace_final_obs_from_infos(
     done_mask: np.ndarray,
     infos: List[Dict[str, Dict[str, object]]],
 ) -> Dict[str, np.ndarray]:
-    out = {agent: np.asarray(next_obs_batch[agent], dtype=np.float32).copy() for agent in AGENTS}
+    out = {agent: np.asarray(next_obs_batch[agent]).copy() for agent in AGENTS}
     for env_idx, done in enumerate(done_mask):
         if not bool(done):
             continue
@@ -408,7 +567,7 @@ def _maybe_replace_final_obs_from_infos(
         for agent in AGENTS:
             final_obs = info_env[agent].get("final_observation")
             if final_obs is not None:
-                out[agent][env_idx] = np.asarray(final_obs, dtype=np.float32)
+                out[agent][env_idx] = np.asarray(final_obs)
     return out
 
 
@@ -452,13 +611,19 @@ def train(args: argparse.Namespace) -> None:
             "handshake + fixed-standing + arms_only."
         )
 
-    env, obs_batch, _ = _build_env(args, stage=current_stage, seed=args.seed)
+    env, raw_obs_batch, reset_infos = _build_env(args, stage=current_stage, seed=args.seed)
+    obs_adapter = _build_obs_adapter(args, device)
+    obs_batch = _transform_obs_batch(
+        raw_obs_batch=raw_obs_batch,
+        infos_payload=reset_infos,
+        num_envs=args.num_envs,
+        adapter=obs_adapter,
+    )
 
     if obs_batch["h0"].ndim != 2:
         env.close()
         raise ValueError(
-            "MADDPG currently supports vector observations only. "
-            "Use --observation-mode proprio."
+            f"Expected 2D encoded observations [N,obs_dim], got shape {obs_batch['h0'].shape}."
         )
 
     obs_dim = int(obs_batch["h0"].shape[-1])
@@ -494,6 +659,7 @@ def train(args: argparse.Namespace) -> None:
         num_agents=n_agents,
         obs_dim=obs_dim,
         act_dim=act_dim,
+        obs_dtype=np.float16 if args.replay_obs_dtype == "float16" else np.float32,
     )
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -559,35 +725,37 @@ def train(args: argparse.Namespace) -> None:
                 next_obs_dict, rewards_dict, terminations, truncations, infos = env.step(env_actions)
 
                 done_mask, reasons = _extract_done_and_reasons_single(terminations, truncations, infos)
-                next_obs_for_buffer = {
-                    agent: np.asarray(next_obs_dict[agent], dtype=np.float32)[None, ...]
+                raw_next_obs_for_buffer = {
+                    agent: np.asarray(next_obs_dict[agent])[None, ...]
                     for agent in AGENTS
                 }
-                next_obs_for_rollout = next_obs_for_buffer
+                raw_next_obs_for_rollout = raw_next_obs_for_buffer
+                infos_list = [infos]
+                rollout_infos_payload: Any = infos_list
 
                 rewards_batch = {
                     agent: np.asarray([float(rewards_dict[agent])], dtype=np.float32)
                     for agent in AGENTS
                 }
-                infos_list = [infos]
 
                 if bool(done_mask[0]):
-                    reset_obs, _ = env.reset(seed=None, options={"stage": int(current_stage)})
-                    next_obs_for_rollout = {
-                        agent: np.asarray(reset_obs[agent], dtype=np.float32)[None, ...]
+                    reset_obs, reset_infos = env.reset(seed=None, options={"stage": int(current_stage)})
+                    raw_next_obs_for_rollout = {
+                        agent: np.asarray(reset_obs[agent])[None, ...]
                         for agent in AGENTS
                     }
+                    rollout_infos_payload = reset_infos
 
             else:
                 next_obs_vec, rewards_vec, terminations, truncations, infos_list = env.step(actions_batch)
                 done_mask, reasons = _extract_done_and_reasons_vec(terminations, truncations, infos_list)
 
-                next_obs_for_rollout = {
-                    agent: np.asarray(next_obs_vec[agent], dtype=np.float32)
+                raw_next_obs_for_rollout = {
+                    agent: np.asarray(next_obs_vec[agent])
                     for agent in AGENTS
                 }
-                next_obs_for_buffer = _maybe_replace_final_obs_from_infos(
-                    next_obs_batch=next_obs_for_rollout,
+                raw_next_obs_for_buffer = _maybe_replace_final_obs_from_infos(
+                    next_obs_batch=raw_next_obs_for_rollout,
                     done_mask=done_mask,
                     infos=infos_list,
                 )
@@ -595,6 +763,24 @@ def train(args: argparse.Namespace) -> None:
                     agent: np.asarray(rewards_vec[agent], dtype=np.float32)
                     for agent in AGENTS
                 }
+                rollout_infos_payload = infos_list
+
+            next_obs_for_buffer = _transform_obs_batch(
+                raw_obs_batch=raw_next_obs_for_buffer,
+                infos_payload=infos_list,
+                num_envs=args.num_envs,
+                adapter=obs_adapter,
+                done_mask=done_mask,
+                use_reset_info_for_done=False,
+            )
+            next_obs_for_rollout = _transform_obs_batch(
+                raw_obs_batch=raw_next_obs_for_rollout,
+                infos_payload=rollout_infos_payload,
+                num_envs=args.num_envs,
+                adapter=obs_adapter,
+                done_mask=done_mask,
+                use_reset_info_for_done=(args.num_envs > 1),
+            )
 
             obs_joint, act_joint, rew_joint, next_obs_joint, done_joint = _stack_joint(
                 obs_batch=obs_batch,
@@ -718,7 +904,13 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                     env.close()
-                    env, obs_batch, _ = _build_env(args, stage=current_stage, seed=None)
+                    env, raw_obs_batch, reset_infos = _build_env(args, stage=current_stage, seed=None)
+                    obs_batch = _transform_obs_batch(
+                        raw_obs_batch=raw_obs_batch,
+                        infos_payload=reset_infos,
+                        num_envs=args.num_envs,
+                        adapter=obs_adapter,
+                    )
                     ep_returns[:] = 0.0
                     ep_lengths[:] = 0
 
@@ -783,6 +975,9 @@ def train(args: argparse.Namespace) -> None:
                     "args": vars(args),
                     "global_step": global_step,
                     "stage": current_stage,
+                    "observation_mode": args.observation_mode,
+                    "uses_visual_encoder": obs_adapter.use_visual_encoder,
+                    "uses_proprio_with_visual": obs_adapter.use_proprio_with_visual,
                     "obs_dim": obs_dim,
                     "act_dim": act_dim,
                     "n_agents": n_agents,

@@ -95,3 +95,26 @@ def test_gray_reset_returns_egocentric_frames():
             assert infos[agent]["observation_mode"] == "gray"
     finally:
         env.close()
+
+
+def test_visual_mode_can_emit_proprio_in_info():
+    try:
+        env = HumanoidCollabEnv(
+            task="handshake",
+            observation_mode="gray",
+            obs_rgb_width=40,
+            obs_rgb_height=30,
+            emit_proprio_info=True,
+        )
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+    try:
+        _, infos = _reset_or_skip(env, seed=9)
+        for agent in ["h0", "h1"]:
+            prop = infos[agent].get("proprio_obs")
+            assert isinstance(prop, np.ndarray)
+            assert prop.dtype == np.float32
+            assert prop.ndim == 1
+            assert prop.shape[0] > 0
+    finally:
+        env.close()

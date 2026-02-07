@@ -37,6 +37,8 @@ class HumanoidCollabEnv(ParallelEnv):
             or "gray" (egocentric grayscale image).
         obs_rgb_width: Visual observation width (used when observation_mode is rgb/gray).
         obs_rgb_height: Visual observation height (used when observation_mode is rgb/gray).
+        emit_proprio_info: If True, attach vector proprio observations to infos as
+            `proprio_obs` on reset/step.
     """
 
     metadata = {
@@ -59,6 +61,7 @@ class HumanoidCollabEnv(ParallelEnv):
         observation_mode: str = "proprio",
         obs_rgb_width: int = 84,
         obs_rgb_height: int = 84,
+        emit_proprio_info: bool = False,
     ):
         super().__init__()
 
@@ -74,6 +77,7 @@ class HumanoidCollabEnv(ParallelEnv):
         self.observation_mode = str(observation_mode)
         self.obs_rgb_width = int(obs_rgb_width)
         self.obs_rgb_height = int(obs_rgb_height)
+        self.emit_proprio_info = bool(emit_proprio_info)
         if self.control_mode not in {"all", "arms_only"}:
             raise ValueError(
                 f"Unknown control_mode '{self.control_mode}'. "
@@ -224,6 +228,11 @@ class HumanoidCollabEnv(ParallelEnv):
         # Build observations
         contact_info = self.contact_detector.detect_contacts(self.data)
         observations = self._build_full_observations(contact_info)
+        proprio_obs = (
+            self._build_proprio_observations(contact_info)
+            if self.emit_proprio_info
+            else None
+        )
 
         infos = {
             agent: {
@@ -234,6 +243,11 @@ class HumanoidCollabEnv(ParallelEnv):
                 "control_mode": self.control_mode,
                 "observation_mode": self.observation_mode,
                 "weights": self.task_config.get_weights_dict(),
+                **(
+                    {"proprio_obs": proprio_obs[agent]}
+                    if proprio_obs is not None
+                    else {}
+                ),
             }
             for agent in self.agents
         }
@@ -323,6 +337,11 @@ class HumanoidCollabEnv(ParallelEnv):
 
         terminations = {agent: self._terminated for agent in self.agents}
         truncations = {agent: self._truncated for agent in self.agents}
+        proprio_obs = (
+            self._build_proprio_observations(contact_info)
+            if self.emit_proprio_info
+            else None
+        )
 
         infos = {}
         for agent in self.agents:
@@ -339,6 +358,11 @@ class HumanoidCollabEnv(ParallelEnv):
                 **reward_info,
                 **success_info,
                 **{k: v for k, v in contact_info.items()},
+                **(
+                    {"proprio_obs": proprio_obs[agent]}
+                    if proprio_obs is not None
+                    else {}
+                ),
             }
 
         if self._terminated or self._truncated:
@@ -350,6 +374,10 @@ class HumanoidCollabEnv(ParallelEnv):
         """Build full observations = base obs + task-specific obs."""
         if self.observation_mode in {"rgb", "gray"}:
             return self._build_visual_observations()
+        return self._build_proprio_observations(contact_info)
+
+    def _build_proprio_observations(self, contact_info: Dict[str, bool]) -> Dict[str, np.ndarray]:
+        """Build proprio observations with task-specific vector features."""
 
         base_obs = self.obs_builder.build_base_observations(self.data)
 

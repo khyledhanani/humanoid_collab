@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from typing import Dict
+from dataclasses import dataclass
+from typing import Any, Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from humanoid_collab import HumanoidCollabEnv
+from humanoid_collab.vision import load_frozen_encoder_from_vae_checkpoint
 
 
 AGENTS = ("h0", "h1")
@@ -56,6 +58,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional control mode override.",
     )
     parser.add_argument(
+        "--encoder-checkpoint",
+        type=str,
+        default=None,
+        help="Optional VAE checkpoint override for visual observations.",
+    )
+    parser.add_argument(
+        "--vision-use-proprio",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override proprio+latent concatenation for visual observations.",
+    )
+    parser.add_argument(
         "--fixed-standing",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -83,6 +97,8 @@ def make_env_from_ckpt_args(train_args: Dict[str, object], args: argparse.Namesp
         fixed_standing=bool(train_args.get("fixed_standing", False)),
         control_mode=str(train_args.get("control_mode", "all")),
         observation_mode=str(train_args.get("observation_mode", "proprio")),
+        obs_rgb_width=int(train_args.get("obs_rgb_width", 84)),
+        obs_rgb_height=int(train_args.get("obs_rgb_height", 84)),
     )
     if args.stage is not None:
         kwargs["stage"] = int(args.stage)
@@ -92,15 +108,95 @@ def make_env_from_ckpt_args(train_args: Dict[str, object], args: argparse.Namesp
         kwargs["control_mode"] = str(args.control_mode)
     if args.fixed_standing is not None:
         kwargs["fixed_standing"] = bool(args.fixed_standing)
+    vision_use_proprio = bool(train_args.get("vision_use_proprio", True))
+    if args.vision_use_proprio is not None:
+        vision_use_proprio = bool(args.vision_use_proprio)
+    kwargs["emit_proprio_info"] = bool(kwargs["observation_mode"] in {"rgb", "gray"} and vision_use_proprio)
 
     print(
         "render env config: "
         f"task={kwargs['task']} stage={kwargs['stage']} "
         f"physics_profile={kwargs['physics_profile']} "
         f"fixed_standing={kwargs['fixed_standing']} "
-        f"control_mode={kwargs['control_mode']}"
+        f"control_mode={kwargs['control_mode']} "
+        f"observation_mode={kwargs['observation_mode']} "
+        f"emit_proprio_info={kwargs['emit_proprio_info']}"
     )
     return HumanoidCollabEnv(**kwargs)
+
+
+@dataclass
+class RenderObsAdapter:
+    use_visual_encoder: bool
+    use_proprio_with_visual: bool
+    encoder_bundle: Any
+    device: torch.device
+
+
+def _build_obs_adapter(
+    train_args: Dict[str, object],
+    cli_args: argparse.Namespace,
+    device: torch.device,
+) -> RenderObsAdapter:
+    observation_mode = str(train_args.get("observation_mode", "proprio"))
+    if observation_mode == "proprio":
+        return RenderObsAdapter(
+            use_visual_encoder=False,
+            use_proprio_with_visual=False,
+            encoder_bundle=None,
+            device=device,
+        )
+    encoder_ckpt = cli_args.encoder_checkpoint
+    if encoder_ckpt is None:
+        encoder_ckpt = train_args.get("encoder_checkpoint")
+    if encoder_ckpt is None:
+        raise ValueError(
+            "Visual checkpoint render requires an encoder checkpoint. "
+            "Pass --encoder-checkpoint or include encoder_checkpoint in training args."
+        )
+    bundle = load_frozen_encoder_from_vae_checkpoint(str(encoder_ckpt), device=device)
+    if bundle.observation_mode != observation_mode:
+        raise ValueError(
+            f"Encoder observation_mode='{bundle.observation_mode}' does not match "
+            f"checkpoint observation_mode='{observation_mode}'."
+        )
+    use_prop = bool(train_args.get("vision_use_proprio", True))
+    if cli_args.vision_use_proprio is not None:
+        use_prop = bool(cli_args.vision_use_proprio)
+    return RenderObsAdapter(
+        use_visual_encoder=True,
+        use_proprio_with_visual=use_prop,
+        encoder_bundle=bundle,
+        device=device,
+    )
+
+
+def _transform_obs(
+    obs: Dict[str, np.ndarray],
+    infos: Dict[str, Dict[str, object]],
+    adapter: RenderObsAdapter,
+) -> Dict[str, np.ndarray]:
+    if not adapter.use_visual_encoder:
+        return {agent: np.asarray(obs[agent], dtype=np.float32) for agent in AGENTS}
+    out: Dict[str, np.ndarray] = {}
+    for agent in AGENTS:
+        frame = np.asarray(obs[agent])
+        x = torch.as_tensor(frame[None, ...], dtype=torch.float32, device=adapter.device) / 255.0
+        x = x.permute(0, 3, 1, 2).contiguous()
+        with torch.no_grad():
+            z = adapter.encoder_bundle.vae.encode_mean(x).squeeze(0).cpu().numpy().astype(np.float32)
+        if adapter.use_proprio_with_visual:
+            p = infos[agent].get("proprio_obs")
+            if p is None:
+                raise KeyError(
+                    "Expected proprio_obs in infos for visual render. "
+                    "Ensure render env has emit_proprio_info=True."
+                )
+            p = np.asarray(p, dtype=np.float32)
+            out[agent] = np.concatenate([p, z], axis=-1).astype(np.float32)
+        else:
+            out[agent] = z
+    return out
 
 
 def main() -> None:
@@ -111,6 +207,7 @@ def main() -> None:
     obs_dim = int(ckpt["obs_dim"])
     act_dim = int(ckpt["act_dim"])
     hidden_size = int(train_args.get("hidden_size", 256))
+    adapter = _build_obs_adapter(train_args=train_args, cli_args=args, device=torch.device("cpu"))
 
     actors = {agent: Actor(obs_dim, act_dim, hidden_size) for agent in AGENTS}
     for agent in AGENTS:
@@ -131,7 +228,8 @@ def main() -> None:
     try:
         for ep in range(args.episodes):
             obs, infos = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
-            env_obs_dim = int(np.asarray(obs["h0"]).shape[0])
+            policy_obs = _transform_obs(obs, infos, adapter)
+            env_obs_dim = int(np.asarray(policy_obs["h0"]).shape[0])
             if env_obs_dim != obs_dim:
                 raise ValueError(
                     f"Observation-dimension mismatch between checkpoint and env: "
@@ -146,7 +244,7 @@ def main() -> None:
             while not done:
                 actions = {}
                 for agent in AGENTS:
-                    obs_t = torch.as_tensor(obs[agent], dtype=torch.float32).unsqueeze(0)
+                    obs_t = torch.as_tensor(policy_obs[agent], dtype=torch.float32).unsqueeze(0)
                     with torch.no_grad():
                         action = actors[agent](obs_t)
                     act_np = action.squeeze(0).cpu().numpy()
@@ -155,6 +253,7 @@ def main() -> None:
                     actions[agent] = np.clip(act_np, -1.0, 1.0).astype(np.float32)
 
                 obs, rewards, terminations, truncations, infos = env.step(actions)
+                policy_obs = _transform_obs(obs, infos, adapter)
                 env.render()
                 ep_ret += float(rewards["h0"])
                 steps += 1
