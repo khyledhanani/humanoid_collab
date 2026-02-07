@@ -36,10 +36,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--noise", type=float, default=0.0, help="Optional exploration noise at eval time.")
+    parser.add_argument(
+        "--stage",
+        type=int,
+        default=None,
+        help="Optional stage override. Defaults to stage saved in checkpoint args.",
+    )
+    parser.add_argument(
+        "--physics-profile",
+        type=str,
+        default=None,
+        help="Optional physics profile override.",
+    )
+    parser.add_argument(
+        "--control-mode",
+        type=str,
+        choices=["all", "arms_only"],
+        default=None,
+        help="Optional control mode override.",
+    )
+    parser.add_argument(
+        "--fixed-standing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override fixed-standing behavior. Use --no-fixed-standing for locomotion.",
+    )
     return parser.parse_args()
 
 
-def make_env_from_ckpt_args(train_args: Dict[str, object]):
+def make_env_from_ckpt_args(train_args: Dict[str, object], args: argparse.Namespace):
     backend = str(train_args.get("backend", "cpu"))
     if backend != "cpu":
         raise ValueError(
@@ -47,7 +72,7 @@ def make_env_from_ckpt_args(train_args: Dict[str, object]):
             "Only CPU env backend is supported."
         )
 
-    kwargs = dict(
+    kwargs: Dict[str, object] = dict(
         task=str(train_args.get("task", "handshake")),
         render_mode="human",
         stage=int(train_args.get("stage", 1)),
@@ -58,6 +83,22 @@ def make_env_from_ckpt_args(train_args: Dict[str, object]):
         fixed_standing=bool(train_args.get("fixed_standing", False)),
         control_mode=str(train_args.get("control_mode", "all")),
         observation_mode=str(train_args.get("observation_mode", "proprio")),
+    )
+    if args.stage is not None:
+        kwargs["stage"] = int(args.stage)
+    if args.physics_profile is not None:
+        kwargs["physics_profile"] = str(args.physics_profile)
+    if args.control_mode is not None:
+        kwargs["control_mode"] = str(args.control_mode)
+    if args.fixed_standing is not None:
+        kwargs["fixed_standing"] = bool(args.fixed_standing)
+
+    print(
+        "render env config: "
+        f"task={kwargs['task']} stage={kwargs['stage']} "
+        f"physics_profile={kwargs['physics_profile']} "
+        f"fixed_standing={kwargs['fixed_standing']} "
+        f"control_mode={kwargs['control_mode']}"
     )
     return HumanoidCollabEnv(**kwargs)
 
@@ -76,12 +117,27 @@ def main() -> None:
         actors[agent].load_state_dict(ckpt["actors"][agent])
         actors[agent].eval()
 
-    env = make_env_from_ckpt_args(train_args)
+    env = make_env_from_ckpt_args(train_args, args)
+    env_act_dim = int(env.action_space("h0").shape[0])
+    if env_act_dim != act_dim:
+        env.close()
+        raise ValueError(
+            f"Action-dimension mismatch between checkpoint and env: "
+            f"ckpt act_dim={act_dim}, env act_dim={env_act_dim}. "
+            "Use matching control settings for rendering."
+        )
     rng = np.random.default_rng(args.seed)
 
     try:
         for ep in range(args.episodes):
             obs, infos = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
+            env_obs_dim = int(np.asarray(obs["h0"]).shape[0])
+            if env_obs_dim != obs_dim:
+                raise ValueError(
+                    f"Observation-dimension mismatch between checkpoint and env: "
+                    f"ckpt obs_dim={obs_dim}, env obs_dim={env_obs_dim}. "
+                    "Use matching env configuration for rendering."
+                )
             done = False
             ep_ret = 0.0
             steps = 0
