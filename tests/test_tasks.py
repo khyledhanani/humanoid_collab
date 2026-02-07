@@ -54,8 +54,8 @@ class TestHandshakeTask:
 
     def test_handshake_curriculum_stages(self):
         config = get_task("handshake")
-        assert config.num_curriculum_stages == 3
-        for stage in range(3):
+        assert config.num_curriculum_stages == 4
+        for stage in range(4):
             config.set_stage(stage)
             weights = config.get_weights_dict()
             assert isinstance(weights, dict)

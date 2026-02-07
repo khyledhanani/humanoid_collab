@@ -16,14 +16,32 @@ from humanoid_collab.utils.kinematics import (
 )
 
 
-# Curriculum weights per stage (scaled down 10x for better value function learning)
+# Curriculum weights per stage.
 _HANDSHAKE_STAGES = {
-    0: dict(w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.0, w_contact=0.0,
-            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0),
-    1: dict(w_dist=0.15, w_face=0.10, w_stab=0.05, w_hand_prox=0.30, w_contact=2.0,
-            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0),
-    2: dict(w_dist=0.10, w_face=0.08, w_stab=0.05, w_hand_prox=0.15, w_contact=5.0,
-            w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=100.0),
+    # Stage 0: locomotion-first curriculum. No hand shaping/contact requirement.
+    0: dict(
+        w_dist=0.12, w_face=0.08, w_stab=0.03, w_hand_prox=0.0, w_contact=0.0,
+        w_approach=0.35, w_stop=0.25, w_upright=0.15,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=10.0,
+    ),
+    # Stage 1: transition into handshake objective.
+    1: dict(
+        w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.0, w_contact=0.0,
+        w_approach=0.06, w_stop=0.05, w_upright=0.04,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0,
+    ),
+    # Stage 2: emphasize right-hand proximity/contact.
+    2: dict(
+        w_dist=0.15, w_face=0.10, w_stab=0.05, w_hand_prox=0.30, w_contact=2.0,
+        w_approach=0.05, w_stop=0.04, w_upright=0.03,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0,
+    ),
+    # Stage 3: strongest contact objective while retaining small locomotion regularization.
+    3: dict(
+        w_dist=0.10, w_face=0.08, w_stab=0.05, w_hand_prox=0.15, w_contact=5.0,
+        w_approach=0.04, w_stop=0.03, w_upright=0.03,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=100.0,
+    ),
 }
 
 # Handshake thresholds
@@ -33,6 +51,11 @@ V_THRESH = 0.8
 TILT_THRESH = 0.5
 ALPHA_DIST = 3.0
 BETA_SPEED = 2.0
+APPROACH_DIST_GATE = 0.9
+STOP_ZONE_MIN = 0.6
+STOP_ZONE_MAX = 0.9
+LOCO_FACING_THRESH = 0.4
+LOCO_SPEED_THRESH = 1.1
 
 
 @register_task
@@ -44,7 +67,7 @@ class HandshakeTask(TaskConfig):
 
     @property
     def num_curriculum_stages(self) -> int:
-        return 3
+        return 4
 
     def __init__(self):
         self._weights = _HANDSHAKE_STAGES[0].copy()
@@ -142,6 +165,61 @@ class HandshakeTask(TaskConfig):
         info["relative_speed"] = rel_speed
         info["r_stability"] = r_stab
 
+        # Locomotion shaping: encourage approach at long range.
+        chest_delta = h1_chest - h0_chest
+        chest_delta[2] = 0.0
+        chest_dist_xy = np.linalg.norm(chest_delta)
+        if chest_dist_xy > 1e-6:
+            dir_h0_to_h1 = chest_delta / chest_dist_xy
+        else:
+            dir_h0_to_h1 = np.zeros_like(chest_delta)
+        dir_h1_to_h0 = -dir_h0_to_h1
+
+        h0_v_xy = h0_vel.copy()
+        h1_v_xy = h1_vel.copy()
+        h0_v_xy[2] = 0.0
+        h1_v_xy[2] = 0.0
+
+        approach_speed_h0 = max(0.0, float(np.dot(h0_v_xy, dir_h0_to_h1)))
+        approach_speed_h1 = max(0.0, float(np.dot(h1_v_xy, dir_h1_to_h0)))
+        approach_sum = np.clip(approach_speed_h0, 0.0, 1.5) + np.clip(approach_speed_h1, 0.0, 1.5)
+        if dist > APPROACH_DIST_GATE:
+            r_approach = w["w_approach"] * approach_sum
+        else:
+            r_approach = 0.0
+        total += r_approach
+        info["r_approach"] = r_approach
+        info["approach_speed_h0"] = approach_speed_h0
+        info["approach_speed_h1"] = approach_speed_h1
+
+        # Locomotion shaping: encourage stopping in pre-contact zone.
+        h0_speed = np.linalg.norm(h0_v_xy)
+        h1_speed = np.linalg.norm(h1_v_xy)
+        stop_score = np.exp(-2.0 * h0_speed) + np.exp(-2.0 * h1_speed)
+        if STOP_ZONE_MIN < dist < STOP_ZONE_MAX:
+            r_stop = w["w_stop"] * stop_score
+        else:
+            r_stop = 0.0
+        total += r_stop
+        info["r_stop"] = r_stop
+        info["h0_speed_xy"] = h0_speed
+        info["h1_speed_xy"] = h1_speed
+
+        # Light upright regularization carried through all stages.
+        h0_xmat = id_cache.get_torso_xmat(data, "h0")
+        h1_xmat = id_cache.get_torso_xmat(data, "h1")
+        h0_tilt = compute_tilt_angle(get_up_vector(h0_xmat))
+        h1_tilt = compute_tilt_angle(get_up_vector(h1_xmat))
+        upright_score = 0.5 * (
+            max(0.0, 1.0 - h0_tilt / TILT_THRESH)
+            + max(0.0, 1.0 - h1_tilt / TILT_THRESH)
+        )
+        r_upright = w["w_upright"] * upright_score
+        total += r_upright
+        info["r_upright"] = r_upright
+        info["h0_tilt"] = h0_tilt
+        info["h1_tilt"] = h1_tilt
+
         # --- Hand proximity shaping (right-to-right only) ---
         h0_rhand = id_cache.get_site_xpos(data, self.SHAKE_SITE_A)
         h1_rhand = id_cache.get_site_xpos(data, self.SHAKE_SITE_B)
@@ -233,17 +311,31 @@ class HandshakeTask(TaskConfig):
 
         h0_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h0"])
         h1_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h1"])
+        h0_speed = np.linalg.norm(h0_vel[0:2])
+        h1_speed = np.linalg.norm(h1_vel[0:2])
         rel_speed = np.linalg.norm(h0_vel - h1_vel)
         speed_ok = rel_speed < V_THRESH
         info["shake_rel_speed"] = rel_speed
         info["shake_speed_ok"] = speed_ok
+        info["shake_h0_speed_xy"] = h0_speed
+        info["shake_h1_speed_xy"] = h1_speed
 
         h0_tilt = compute_tilt_angle(get_up_vector(h0_xmat))
         h1_tilt = compute_tilt_angle(get_up_vector(h1_xmat))
         upright_ok = h0_tilt < TILT_THRESH and h1_tilt < TILT_THRESH
         info["shake_upright_ok"] = upright_ok
 
-        condition = dist_ok and facing_ok and contact_ok and speed_ok and upright_ok
+        if self._stage == 0:
+            # Stage-0 success is locomotion quality near handshake distance.
+            facing_near_ok = facing > LOCO_FACING_THRESH
+            stop_near_ok = max(h0_speed, h1_speed) < LOCO_SPEED_THRESH
+            condition = dist_ok and facing_near_ok and stop_near_ok and upright_ok
+            info["shake_contact_ok"] = True
+            info["shake_stage0_facing_ok"] = facing_near_ok
+            info["shake_stage0_stop_ok"] = stop_near_ok
+        else:
+            condition = dist_ok and facing_ok and contact_ok and speed_ok and upright_ok
+
         info["shake_condition"] = condition
         return condition, info
 
