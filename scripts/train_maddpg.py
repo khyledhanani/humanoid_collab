@@ -47,7 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=600)
     parser.add_argument("--frame-skip", type=int, default=5)
     parser.add_argument("--hold-target", type=int, default=30)
-    parser.add_argument("--fixed-standing", action="store_true", default=True)
+    parser.add_argument(
+        "--fixed-standing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Weld torsos to world (fixed standing). Use --no-fixed-standing for locomotion.",
+    )
     parser.add_argument("--control-mode", type=str, default="arms_only", choices=["all", "arms_only"])
     parser.add_argument("--observation-mode", type=str, default="proprio", choices=["proprio"])
 
