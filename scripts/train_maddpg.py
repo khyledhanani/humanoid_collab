@@ -603,11 +603,11 @@ def train(args: argparse.Namespace) -> None:
         and bool(args.fixed_standing)
         and args.control_mode == "arms_only"
         and current_stage == 0
-        and max_stage >= 1
+        and max_stage >= 2
     ):
-        current_stage = 1
+        current_stage = 2
         print(
-            "curriculum guard: using stage 1 instead of stage 0 for "
+            "curriculum guard: using stage 2 instead of stage 0 for "
             "handshake + fixed-standing + arms_only."
         )
 

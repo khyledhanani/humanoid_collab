@@ -25,8 +25,10 @@ _HANDSHAKE_STAGES = {
         w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=10.0,
     ),
     # Stage 1: transition into handshake objective.
+    # Include weak hand/contact shaping so fixed-standing arms-only training
+    # can discover sparse handshake events before stage 2.
     1: dict(
-        w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.0, w_contact=0.0,
+        w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.12, w_contact=0.6,
         w_approach=0.06, w_stop=0.05, w_upright=0.04,
         w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0,
     ),

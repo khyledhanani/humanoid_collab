@@ -74,7 +74,7 @@ python scripts/benchmark_backends.py --task hug --mode both --horizons 100 1000 
 python scripts/benchmark_backends.py --task hug --mode subproc --vec-env-backend shared_memory --num-envs 8 --horizons 10000 --repeats 3
 python scripts/train_ippo.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --physics-profile default --total-steps 500000 --rollout-steps 1024 --ppo-epochs 8 --minibatch-size 256
 python scripts/render_ippo.py --checkpoint checkpoints/ippo_handshake_fixed_arms/ippo_update_000100.pt --episodes 3 --deterministic
-python scripts/train_maddpg.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --stage 1 --num-envs 8 --vec-env-backend shared_memory --total-steps 800000 --device cuda
+python scripts/train_maddpg.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --stage 2 --num-envs 8 --vec-env-backend shared_memory --total-steps 800000 --device cuda
 python scripts/render_maddpg.py --checkpoint checkpoints/maddpg_handshake_fixed_arms/maddpg_step_0800000.pt --episodes 3
 ```
 
