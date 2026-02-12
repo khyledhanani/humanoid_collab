@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", type=str, default="cpu", choices=["cpu"])
     parser.add_argument("--physics-profile", type=str, default="default", choices=available_physics_profiles())
     parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--horizon", type=int, default=600)
+    parser.add_argument("--horizon", type=int, default=300)
     parser.add_argument("--frame-skip", type=int, default=5)
     parser.add_argument("--hold-target", type=int, default=30)
     parser.add_argument(
@@ -148,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", type=str, default="runs/maddpg_handshake_fixed_arms")
     parser.add_argument("--save-dir", type=str, default="checkpoints/maddpg_handshake_fixed_arms")
     parser.add_argument("--save-every-steps", type=int, default=50_000)
+    parser.add_argument("--resume-from", type=str, default=None, help="Resume training from a checkpoint path.")
     parser.add_argument("--print-every-steps", type=int, default=2_048)
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="humanoid-collab")
@@ -697,6 +698,70 @@ def train(args: argparse.Namespace) -> None:
     actor_loss_hist = {agent: [] for agent in AGENTS}
     q_hist = {agent: [] for agent in AGENTS}
 
+    if args.resume_from is not None:
+        if not os.path.isfile(args.resume_from):
+            env.close()
+            logger.finish()
+            raise FileNotFoundError(f"--resume-from checkpoint not found: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device)
+
+        ckpt_obs_dim = int(ckpt.get("obs_dim", obs_dim))
+        ckpt_act_dim = int(ckpt.get("act_dim", act_dim))
+        ckpt_agents = int(ckpt.get("n_agents", n_agents))
+        if ckpt_obs_dim != obs_dim or ckpt_act_dim != act_dim or ckpt_agents != n_agents:
+            env.close()
+            logger.finish()
+            raise ValueError(
+                "Resume checkpoint dimensions do not match current run config: "
+                f"ckpt(obs={ckpt_obs_dim}, act={ckpt_act_dim}, n_agents={ckpt_agents}) "
+                f"!= run(obs={obs_dim}, act={act_dim}, n_agents={n_agents})."
+            )
+        if "actors" not in ckpt or "critics" not in ckpt:
+            env.close()
+            logger.finish()
+            raise KeyError(
+                f"Checkpoint at '{args.resume_from}' is missing actor/critic weights."
+            )
+
+        for agent in AGENTS:
+            actors[agent].load_state_dict(ckpt["actors"][agent])
+            critics[agent].load_state_dict(ckpt["critics"][agent])
+            if "target_actors" in ckpt and agent in ckpt["target_actors"]:
+                target_actors[agent].load_state_dict(ckpt["target_actors"][agent])
+            else:
+                _hard_update(target_actors[agent], actors[agent])
+            if "target_critics" in ckpt and agent in ckpt["target_critics"]:
+                target_critics[agent].load_state_dict(ckpt["target_critics"][agent])
+            else:
+                _hard_update(target_critics[agent], critics[agent])
+            if "actor_optim" in ckpt and agent in ckpt["actor_optim"]:
+                actor_optim[agent].load_state_dict(ckpt["actor_optim"][agent])
+            if "critic_optim" in ckpt and agent in ckpt["critic_optim"]:
+                critic_optim[agent].load_state_dict(ckpt["critic_optim"][agent])
+
+        global_step = int(ckpt.get("global_step", 0))
+        collector_iter = int(ckpt.get("collector_iter", 0))
+        grad_updates = int(ckpt.get("grad_updates", 0))
+        actor_updates = int(ckpt.get("actor_updates", 0))
+        last_print_step = int(ckpt.get("last_print_step", global_step))
+        last_save_step = int(ckpt.get("last_save_step", global_step))
+        episodes_in_stage = int(ckpt.get("episodes_in_stage", episodes_in_stage))
+
+        current_stage = int(np.clip(int(ckpt.get("stage", current_stage)), 0, max_stage))
+        env.close()
+        env, raw_obs_batch, reset_infos = _build_env(args, stage=current_stage, seed=None)
+        obs_batch = _transform_obs_batch(
+            raw_obs_batch=raw_obs_batch,
+            infos_payload=reset_infos,
+            num_envs=args.num_envs,
+            adapter=obs_adapter,
+        )
+        print(
+            f"resumed from {args.resume_from}: "
+            f"global_step={global_step} stage={current_stage} "
+            f"grad_updates={grad_updates} actor_updates={actor_updates}"
+        )
+
     def _noise_std(step_count: int) -> float:
         if step_count <= args.start_steps:
             return float(args.exploration_noise_start)
@@ -975,6 +1040,12 @@ def train(args: argparse.Namespace) -> None:
                     "args": vars(args),
                     "global_step": global_step,
                     "stage": current_stage,
+                    "collector_iter": collector_iter,
+                    "grad_updates": grad_updates,
+                    "actor_updates": actor_updates,
+                    "episodes_in_stage": episodes_in_stage,
+                    "last_print_step": last_print_step,
+                    "last_save_step": last_save_step,
                     "observation_mode": args.observation_mode,
                     "uses_visual_encoder": obs_adapter.use_visual_encoder,
                     "uses_proprio_with_visual": obs_adapter.use_proprio_with_visual,

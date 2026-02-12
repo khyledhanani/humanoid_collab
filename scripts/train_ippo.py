@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", type=str, default="runs/ippo_handshake_fixed_arms")
     parser.add_argument("--save-dir", type=str, default="checkpoints/ippo_handshake_fixed_arms")
     parser.add_argument("--save-every-updates", type=int, default=25)
+    parser.add_argument("--resume-from", type=str, default=None, help="Resume training from a checkpoint path.")
     parser.add_argument("--print-every-updates", type=int, default=1)
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="humanoid-collab")
@@ -353,6 +354,7 @@ def train(args: argparse.Namespace) -> None:
 
     global_step = 0
     updates = max(1, args.total_steps // args.rollout_steps)
+    start_update = 1
     ep_return = 0.0
     ep_len = 0
     completed_returns = []
@@ -362,8 +364,43 @@ def train(args: argparse.Namespace) -> None:
     updates_in_stage = 0
     current_clip_coef = float(args.clip_coef)
     current_lr = float(args.lr)
+    if args.resume_from is not None:
+        if not os.path.isfile(args.resume_from):
+            raise FileNotFoundError(f"--resume-from checkpoint not found: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device)
 
-    for update in range(1, updates + 1):
+        ckpt_obs_dim = int(ckpt.get("obs_dim", obs_dim))
+        ckpt_act_dim = int(ckpt.get("act_dim", act_dim))
+        if ckpt_obs_dim != obs_dim or ckpt_act_dim != act_dim:
+            raise ValueError(
+                "Resume checkpoint dimensions do not match current env config: "
+                f"ckpt(obs={ckpt_obs_dim}, act={ckpt_act_dim}) "
+                f"!= env(obs={obs_dim}, act={act_dim})."
+            )
+        if "policies" not in ckpt:
+            raise KeyError(f"Checkpoint at '{args.resume_from}' has no 'policies' key.")
+
+        for agent in AGENTS:
+            policies[agent].load_state_dict(ckpt["policies"][agent])
+        if "optimizers" in ckpt:
+            for agent in AGENTS:
+                if agent in ckpt["optimizers"]:
+                    optimizers[agent].load_state_dict(ckpt["optimizers"][agent])
+
+        global_step = int(ckpt.get("global_step", 0))
+        resume_update = int(ckpt.get("update", global_step // max(1, args.rollout_steps)))
+        start_update = max(1, resume_update + 1)
+        updates_in_stage = max(0, int(ckpt.get("updates_in_stage", 0)))
+        current_stage = int(np.clip(int(ckpt.get("stage", current_stage)), 0, max_stage))
+        current_clip_coef = float(ckpt.get("clip_coef", current_clip_coef))
+        current_lr = float(ckpt.get("lr", current_lr))
+        obs, _ = _reset_env(env, seed=None, stage=current_stage)
+        print(
+            f"resumed from {args.resume_from}: "
+            f"global_step={global_step} update={resume_update} stage={current_stage}"
+        )
+
+    for update in range(start_update, updates + 1):
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / updates
             lr_now = args.lr * frac
@@ -587,10 +624,12 @@ def train(args: argparse.Namespace) -> None:
         if update % args.save_every_updates == 0 or update == updates:
             ckpt_path = os.path.join(args.save_dir, f"ippo_update_{update:06d}.pt")
             payload = {
+                "algo": "ippo",
                 "args": vars(args),
                 "global_step": global_step,
                 "update": update,
                 "stage": current_stage,
+                "updates_in_stage": updates_in_stage,
                 "clip_coef": current_clip_coef,
                 "lr": current_lr,
                 "obs_dim": obs_dim,

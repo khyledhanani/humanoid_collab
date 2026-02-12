@@ -22,6 +22,7 @@ _HANDSHAKE_STAGES = {
     0: dict(
         w_dist=0.12, w_face=0.08, w_stab=0.03, w_hand_prox=0.0, w_contact=0.0,
         w_approach=0.35, w_stop=0.25, w_upright=0.15,
+        w_time=0.0,
         w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=10.0,
     ),
     # Stage 1: transition into handshake objective.
@@ -30,19 +31,24 @@ _HANDSHAKE_STAGES = {
     1: dict(
         w_dist=0.20, w_face=0.10, w_stab=0.05, w_hand_prox=0.12, w_contact=0.6,
         w_approach=0.06, w_stop=0.05, w_upright=0.04,
+        w_time=0.0,
         w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0,
     ),
-    # Stage 2: emphasize right-hand proximity/contact.
+    # Stage 2: contact-first objective.
+    # Disable locomotion shaping to avoid horizon farming in fixed-standing, arms-only
+    # training where approach/stop become easy dense rewards unrelated to contact.
     2: dict(
-        w_dist=0.15, w_face=0.10, w_stab=0.05, w_hand_prox=0.30, w_contact=2.0,
-        w_approach=0.05, w_stop=0.04, w_upright=0.03,
-        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=50.0,
+        w_dist=0.08, w_face=0.05, w_stab=0.04, w_hand_prox=0.25, w_contact=2.0,
+        w_approach=0.0, w_stop=0.0, w_upright=0.015,
+        w_time=-0.20,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=250.0,
     ),
-    # Stage 3: strongest contact objective while retaining small locomotion regularization.
+    # Stage 3: strongest contact objective with the same anti-idling pressure.
     3: dict(
-        w_dist=0.10, w_face=0.08, w_stab=0.05, w_hand_prox=0.15, w_contact=5.0,
-        w_approach=0.04, w_stop=0.03, w_upright=0.03,
-        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=100.0,
+        w_dist=0.06, w_face=0.04, w_stab=0.04, w_hand_prox=0.12, w_contact=5.0,
+        w_approach=0.0, w_stop=0.0, w_upright=0.015,
+        w_time=-0.20,
+        w_energy=-0.0001, w_impact=-0.001, w_fall=-10.0, r_success=350.0,
     ),
 }
 
@@ -91,6 +97,7 @@ class HandshakeTask(TaskConfig):
 
     def get_contact_pairs(self) -> List[Tuple[str, str, str]]:
         return [
+            ("h0_hand_h1_hand", "h0_hand", "h1_hand"),
             ("h0_r_hand_h1_r_hand", "h0_r_hand", "h1_r_hand"),
             ("h0_r_hand_h1_l_hand", "h0_r_hand", "h1_l_hand"),
             ("h0_l_hand_h1_r_hand", "h0_l_hand", "h1_r_hand"),
@@ -269,6 +276,11 @@ class HandshakeTask(TaskConfig):
         r_impact = w["w_impact"] * contact_force_proxy
         total += r_impact
         info["r_impact"] = r_impact
+
+        # Constant per-step time pressure to avoid dense-reward horizon farming.
+        r_time = float(w.get("w_time", 0.0))
+        total += r_time
+        info["r_time"] = r_time
 
         if fallen:
             total += w["w_fall"]
