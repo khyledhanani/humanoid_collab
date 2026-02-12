@@ -58,3 +58,21 @@ def test_handshake_fixed_standing_spawn_is_reachable():
     finally:
         env.close()
 
+
+def test_hug_fixed_standing_spawn_is_reachable():
+    env = HumanoidCollabEnv(
+        task="hug",
+        fixed_standing=True,
+        control_mode="arms_only",
+    )
+    try:
+        env.reset(seed=42)
+        h0_qpos = env.id_cache.joint_qpos_idx["h0"]
+        h1_qpos = env.id_cache.joint_qpos_idx["h1"]
+        h0_x = float(env.data.qpos[h0_qpos[0]])
+        h1_x = float(env.data.qpos[h1_qpos[0]])
+        dist = abs(h1_x - h0_x)
+        # Hug fixed-standing should start close enough for arm wrap behaviors.
+        assert 0.45 <= dist <= 0.75
+    finally:
+        env.close()

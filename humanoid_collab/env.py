@@ -566,7 +566,8 @@ class HumanoidCollabEnv(ParallelEnv):
         if self.task_name == "handshake":
             return 0.4, True
         if self.task_name == "hug":
-            return 0.35, True
+            # Keep chests within a learnable hug range for fixed-standing arm control.
+            return 0.28, True
         return 0.9, True
 
     def _build_control_actuator_indices(self) -> Dict[str, np.ndarray]:

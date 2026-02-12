@@ -26,7 +26,7 @@ class TestTaskRegistry:
 class TestHugTask:
     def test_hug_obs_dim(self):
         config = get_task("hug")
-        assert config.task_obs_dim == 0
+        assert config.task_obs_dim == 16
 
     def test_hug_curriculum_stages(self):
         config = get_task("hug")

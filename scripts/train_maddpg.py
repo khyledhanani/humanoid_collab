@@ -430,6 +430,13 @@ def _resolve_curriculum_threshold(
     return float(thresholds[idx])
 
 
+def _mean_recent(values: List[float], n: int) -> float:
+    if not values:
+        return 0.0
+    k = min(len(values), max(1, n))
+    return float(np.mean(values[-k:]))
+
+
 def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
     return dict(
         task=args.task,
@@ -697,6 +704,9 @@ def train(args: argparse.Namespace) -> None:
     critic_loss_hist = {agent: [] for agent in AGENTS}
     actor_loss_hist = {agent: [] for agent in AGENTS}
     q_hist = {agent: [] for agent in AGENTS}
+    hug_contact_any_hist: List[float] = []
+    hug_dual_contact_hist: List[float] = []
+    hug_hand_back_mean_hist: List[float] = []
 
     if args.resume_from is not None:
         if not os.path.isfile(args.resume_from):
@@ -829,6 +839,25 @@ def train(args: argparse.Namespace) -> None:
                     for agent in AGENTS
                 }
                 rollout_infos_payload = infos_list
+
+            if args.task == "hug":
+                for info_env in infos_list:
+                    h0_info = info_env.get("h0", {})
+                    if not isinstance(h0_info, dict):
+                        continue
+                    if "hug_contact_any" in h0_info:
+                        hug_contact_any_hist.append(float(h0_info["hug_contact_any"]))
+                    if "hug_dual_contact" in h0_info:
+                        hug_dual_contact_hist.append(float(h0_info["hug_dual_contact"]))
+                    if "hug_hand_back_mean" in h0_info:
+                        hug_hand_back_mean_hist.append(float(h0_info["hug_hand_back_mean"]))
+                max_hist = 20_000
+                if len(hug_contact_any_hist) > max_hist:
+                    del hug_contact_any_hist[:-max_hist]
+                if len(hug_dual_contact_hist) > max_hist:
+                    del hug_dual_contact_hist[:-max_hist]
+                if len(hug_hand_back_mean_hist) > max_hist:
+                    del hug_hand_back_mean_hist[:-max_hist]
 
             next_obs_for_buffer = _transform_obs_batch(
                 raw_obs_batch=raw_next_obs_for_buffer,
@@ -1017,6 +1046,13 @@ def train(args: argparse.Namespace) -> None:
                         algo_metrics[f"{agent}/actor_loss"] = float(np.mean(actor_loss_hist[agent][-100:]))
                     if q_hist[agent]:
                         algo_metrics[f"{agent}/q_mean"] = float(np.mean(q_hist[agent][-100:]))
+                task_metrics: Dict[str, float] = {
+                    "stage": float(current_stage),
+                }
+                if args.task == "hug":
+                    task_metrics["hug_contact_any_mean"] = _mean_recent(hug_contact_any_hist, n=2_000)
+                    task_metrics["hug_dual_contact_mean"] = _mean_recent(hug_dual_contact_hist, n=2_000)
+                    task_metrics["hug_hand_back_mean"] = _mean_recent(hug_hand_back_mean_hist, n=2_000)
                 logger.log(
                     step=global_step,
                     common={
@@ -1028,9 +1064,7 @@ def train(args: argparse.Namespace) -> None:
                         "curriculum_stage": current_stage,
                     },
                     algo=algo_metrics,
-                    task={
-                        "stage": current_stage,
-                    },
+                    task=task_metrics,
                 )
 
             if global_step - last_save_step >= args.save_every_steps or global_step >= args.total_steps:
