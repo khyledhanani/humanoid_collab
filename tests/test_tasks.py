@@ -50,7 +50,7 @@ class TestHugTask:
 class TestHandshakeTask:
     def test_handshake_obs_dim(self):
         config = get_task("handshake")
-        assert config.task_obs_dim == 0
+        assert config.task_obs_dim == 12
 
     def test_handshake_curriculum_stages(self):
         config = get_task("handshake")

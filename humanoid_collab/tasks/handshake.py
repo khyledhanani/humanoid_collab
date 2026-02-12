@@ -134,10 +134,69 @@ class HandshakeTask(TaskConfig):
 
     @property
     def task_obs_dim(self) -> int:
-        return 0
+        return 12
 
     def compute_task_obs(self, data, id_cache, agent, contact_info):
-        return np.zeros((0,), dtype=np.float32)
+        if agent == "h0":
+            own_rhand_site = "h0_rhand"
+            partner_rhand_site = "h1_rhand"
+            own_chest_site = "h0_chest"
+            partner_chest_site = "h1_chest"
+        elif agent == "h1":
+            own_rhand_site = "h1_rhand"
+            partner_rhand_site = "h0_rhand"
+            own_chest_site = "h1_chest"
+            partner_chest_site = "h0_chest"
+        else:
+            raise ValueError(f"Unknown agent '{agent}'")
+
+        own_rhand = id_cache.get_site_xpos(data, own_rhand_site)
+        partner_rhand = id_cache.get_site_xpos(data, partner_rhand_site)
+        own_chest = id_cache.get_site_xpos(data, own_chest_site)
+        partner_chest = id_cache.get_site_xpos(data, partner_chest_site)
+
+        hand_delta_world = partner_rhand - own_rhand
+        chest_delta_world = partner_chest - own_chest
+
+        torso_xmat = id_cache.get_torso_xmat(data, agent)
+        hand_delta_local = torso_xmat.T @ hand_delta_world
+        chest_delta_local = torso_xmat.T @ chest_delta_world
+
+        hand_dist = float(np.linalg.norm(hand_delta_world))
+        chest_dist = float(np.linalg.norm(chest_delta_world))
+
+        h0_xmat = id_cache.get_torso_xmat(data, "h0")
+        h1_xmat = id_cache.get_torso_xmat(data, "h1")
+        facing = float(
+            compute_facing_alignment(get_forward_vector(h0_xmat), get_forward_vector(h1_xmat))
+        )
+
+        correct_contact = 1.0 if contact_info.get(self.SHAKE_PAIR_KEY, False) else 0.0
+        wrong_contact = 1.0 if any(
+            contact_info.get(k, False) for k in self.ALL_HAND_PAIRS if k != self.SHAKE_PAIR_KEY
+        ) else 0.0
+
+        h0_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h0"])
+        h1_vel = get_root_linear_velocity(data, id_cache.joint_qvel_idx["h1"])
+        rel_speed = float(np.linalg.norm(h0_vel - h1_vel))
+
+        return np.asarray(
+            [
+                hand_delta_local[0],
+                hand_delta_local[1],
+                hand_delta_local[2],
+                chest_delta_local[0],
+                chest_delta_local[1],
+                chest_delta_local[2],
+                hand_dist,
+                chest_dist,
+                facing,
+                rel_speed,
+                correct_contact,
+                wrong_contact,
+            ],
+            dtype=np.float32,
+        )
 
     def compute_reward(self, data, id_cache, contact_info, ctrl,
                        contact_force_proxy, hold_steps, success, fallen):

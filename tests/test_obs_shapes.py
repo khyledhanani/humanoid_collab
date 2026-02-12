@@ -21,7 +21,7 @@ class TestObsShape:
         h0_qvel = len(env.id_cache.joint_qvel_idx["h0"])
         expected_base = (h0_qpos - 7) + (h0_qvel - 6) + 4 + 3
         assert env.obs_builder.get_base_obs_dim() == expected_base
-        assert env.task_config.task_obs_dim == 0
+        assert env.obs_builder.get_obs_dim() == expected_base + env.task_config.task_obs_dim
 
     def test_obs_matches_declared_space(self, env):
         obs, _ = env.reset(seed=42)
