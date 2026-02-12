@@ -223,10 +223,10 @@ class HugTask(TaskConfig):
         # Relaxed chest-distance windows for fixed-standing (roots are pinned).
         if self._fixed_standing:
             by_stage = {
-                0: dict(dist_min=0.45, dist_max=0.95, hand_mean_max=0.42, hand_max_max=0.46, need_contact=False, need_dual_contact=False, need_wrap=False),
-                1: dict(dist_min=0.45, dist_max=0.92, hand_mean_max=0.50, hand_max_max=0.46, need_contact=True, need_dual_contact=False, need_wrap=False),
-                2: dict(dist_min=0.45, dist_max=0.88, hand_mean_max=0.48, hand_max_max=0.42, need_contact=True, need_dual_contact=True, need_wrap=False),
-                3: dict(dist_min=0.45, dist_max=0.85, hand_mean_max=0.42, hand_max_max=0.38, need_contact=True, need_dual_contact=True, need_wrap=True),
+                0: dict(dist_min=0.12, dist_max=0.90, hand_mean_max=0.42, hand_max_max=0.46, need_contact=False, need_dual_contact=False, need_wrap=False),
+                1: dict(dist_min=0.12, dist_max=0.86, hand_mean_max=0.50, hand_max_max=0.46, need_contact=True, need_dual_contact=False, need_wrap=False),
+                2: dict(dist_min=0.12, dist_max=0.80, hand_mean_max=0.48, hand_max_max=0.42, need_contact=True, need_dual_contact=True, need_wrap=False),
+                3: dict(dist_min=0.12, dist_max=0.74, hand_mean_max=0.42, hand_max_max=0.38, need_contact=True, need_dual_contact=True, need_wrap=True),
             }
         else:
             by_stage = {
@@ -239,7 +239,7 @@ class HugTask(TaskConfig):
 
     def _get_dist_target(self) -> float:
         if self._fixed_standing:
-            target_by_stage = {0: 0.72, 1: 0.66, 2: 0.61, 3: 0.58}
+            target_by_stage = {0: 0.26, 1: 0.24, 2: 0.22, 3: 0.20}
         else:
             target_by_stage = {0: 0.70, 1: 0.60, 2: 0.52, 3: 0.46}
         return target_by_stage.get(self._stage, target_by_stage[0])

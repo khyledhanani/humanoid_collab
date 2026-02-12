@@ -74,7 +74,7 @@ def test_hug_fixed_standing_spawn_is_reachable():
         h1_x = float(env.data.qpos[h1_qpos[0]])
         dist = abs(h1_x - h0_x)
         # Hug fixed-standing should start close enough for arm wrap behaviors.
-        assert 0.45 <= dist <= 0.75
+        assert 0.15 <= dist <= 0.35
     finally:
         env.close()
 
