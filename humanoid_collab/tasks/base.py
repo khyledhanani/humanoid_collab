@@ -184,6 +184,24 @@ class TaskConfig(ABC):
         """Set the curriculum stage."""
         ...
 
+    def configure(
+        self,
+        fixed_standing: bool = False,
+        control_mode: str = "all",
+    ) -> None:
+        """Configure task with environment settings.
+
+        Called by the environment to inform the task about relevant settings
+        that may affect reward shaping (e.g., whether locomotion is needed).
+
+        Args:
+            fixed_standing: Whether torsos are welded to world
+            control_mode: "all" or "arms_only"
+        """
+        # Default implementation stores the flags; subclasses can override
+        self._fixed_standing = fixed_standing
+        self._control_mode = control_mode
+
     @abstractmethod
     def get_weights_dict(self) -> Dict[str, float]:
         """Get current reward weights as a dictionary for logging."""

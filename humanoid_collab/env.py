@@ -94,6 +94,10 @@ class HumanoidCollabEnv(ParallelEnv):
         # Get task configuration
         self.task_config = get_task(task)
         self.task_config.set_stage(stage)
+        self.task_config.configure(
+            fixed_standing=self.fixed_standing,
+            control_mode=self.control_mode,
+        )
 
         spawn_half_distance, h1_faces_h0 = self._resolve_spawn_setup()
 
