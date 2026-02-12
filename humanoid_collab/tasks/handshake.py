@@ -16,34 +16,34 @@ from humanoid_collab.utils.kinematics import (
 
 # Simplified curriculum - focus on hand proximity and contact
 _HANDSHAKE_STAGES = {
-    # Stage 0: Pure hand proximity shaping
+    # Stage 0: Very strong hand proximity shaping for initial learning
     0: dict(
-        w_hand_dist=1.0,      # Linear reward for reducing hand distance
-        w_contact=5.0,        # Bonus per step when in contact
+        w_hand_dist=3.0,      # Very strong shaping to learn arm control
+        w_contact=10.0,       # Bonus per step when in contact
         w_approach=0.5,       # Locomotion: reward approaching (non-fixed only)
         w_fall=-10.0,
         r_success=100.0,
     ),
-    # Stage 1: Same but higher contact reward
+    # Stage 1: Strong shaping + contact
     1: dict(
-        w_hand_dist=1.0,
-        w_contact=10.0,
+        w_hand_dist=2.5,
+        w_contact=15.0,
         w_approach=0.3,
         w_fall=-10.0,
         r_success=100.0,
     ),
-    # Stage 2: Reduce distance shaping, emphasize contact
+    # Stage 2: Moderate shaping, strong contact
     2: dict(
-        w_hand_dist=0.5,
-        w_contact=15.0,
+        w_hand_dist=2.0,
+        w_contact=20.0,
         w_approach=0.1,
         w_fall=-10.0,
         r_success=150.0,
     ),
-    # Stage 3: Minimal shaping, strong contact
+    # Stage 3: Lighter shaping, very strong contact (for fine-tuning)
     3: dict(
-        w_hand_dist=0.2,
-        w_contact=20.0,
+        w_hand_dist=1.0,
+        w_contact=25.0,
         w_approach=0.0,
         w_fall=-10.0,
         r_success=200.0,
@@ -203,10 +203,13 @@ class HandshakeTask(TaskConfig):
         hand_dist = float(np.linalg.norm(h0_rhand - h1_rhand))
         info["hand_distance"] = hand_dist
 
-        # Linear reward for reducing distance (max ~1.0 when hands touch)
-        # Normalize: assume max distance ~1.5m at start, hands touch at ~0.08m
+        # Combined linear + exponential reward for hand proximity
+        # Linear part: constant gradient for general approach
+        # Exponential part: stronger gradient when close (encourages final approach)
         max_dist = 1.5
-        r_hand_dist = w["w_hand_dist"] * max(0.0, 1.0 - hand_dist / max_dist)
+        linear_part = max(0.0, 1.0 - hand_dist / max_dist)
+        exp_part = np.exp(-2.0 * hand_dist)  # Strong signal when < 0.5m
+        r_hand_dist = w["w_hand_dist"] * (0.5 * linear_part + 0.5 * exp_part)
         total += r_hand_dist
         info["r_hand_dist"] = r_hand_dist
 
