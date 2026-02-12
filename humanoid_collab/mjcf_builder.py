@@ -181,13 +181,26 @@ def _humanoid_actuators(prefix: str) -> str:
     <motor name="{prefix}_right_elbow" joint="{prefix}_right_elbow" gear="25" ctrlrange="-1 1"/>"""
 
 
-def _fixed_standing_equality() -> str:
-    """Constraint block that welds both torsos to world."""
-    return """
+def _fixed_standing_equality(mode: str = "torso") -> str:
+    """Constraint block for fixed-standing setups.
+
+    Args:
+        mode: "torso" to weld torso roots, "lower_body" to weld pelvis/lower-body
+            segments while allowing torso articulation around abdomen joints.
+    """
+    if mode == "torso":
+        return """
   <equality>
     <weld body1="h0_torso" body2="world"/>
     <weld body1="h1_torso" body2="world"/>
   </equality>"""
+    if mode == "lower_body":
+        return """
+  <equality>
+    <weld body1="h0_lower_body" body2="world"/>
+    <weld body1="h1_lower_body" body2="world"/>
+  </equality>"""
+    raise ValueError(f"Unknown fixed_standing mode '{mode}'. Expected 'torso' or 'lower_body'.")
 
 
 def build_mjcf(
@@ -195,6 +208,7 @@ def build_mjcf(
     task_actuator_additions: str = "",
     physics_profile: str = "default",
     fixed_standing: bool = False,
+    fixed_standing_mode: str = "torso",
     spawn_half_distance: float = 1.0,
     h1_faces_h0: bool = False,
 ) -> str:
@@ -204,7 +218,10 @@ def build_mjcf(
         task_worldbody_additions: XML fragment to inject into <worldbody> (e.g., a box body).
         task_actuator_additions: XML fragment to inject into <actuator> (e.g., extra actuators).
         physics_profile: Physics option profile name.
-        fixed_standing: If True, add weld constraints to keep torsos fixed to world.
+        fixed_standing: If True, add weld constraints for fixed-standing configuration.
+        fixed_standing_mode: Weld mode when fixed_standing=True:
+            - "torso": weld each torso root to world
+            - "lower_body": weld each lower body to world
         spawn_half_distance: Spawn offset magnitude from origin for each humanoid torso.
         h1_faces_h0: If True, initialize h1 facing opposite direction.
 
@@ -226,7 +243,7 @@ def build_mjcf(
     h1_body = _humanoid_body("h1", h1_pos, "h1_mat", quat=h1_quat)
     h0_actuators = _humanoid_actuators("h0")
     h1_actuators = _humanoid_actuators("h1")
-    equality_block = _fixed_standing_equality() if fixed_standing else ""
+    equality_block = _fixed_standing_equality(fixed_standing_mode) if fixed_standing else ""
 
     xml = f"""<mujoco model="humanoid_collab">
   <compiler angle="degree" inertiafromgeom="true"/>

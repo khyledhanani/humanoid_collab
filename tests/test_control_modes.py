@@ -1,6 +1,7 @@
 """Tests for fixed-standing and arms-only control modes."""
 
 import numpy as np
+import mujoco
 
 from humanoid_collab.env import HumanoidCollabEnv
 
@@ -74,5 +75,43 @@ def test_hug_fixed_standing_spawn_is_reachable():
         dist = abs(h1_x - h0_x)
         # Hug fixed-standing should start close enough for arm wrap behaviors.
         assert 0.45 <= dist <= 0.75
+    finally:
+        env.close()
+
+
+def test_hug_fixed_standing_uses_lower_body_welds():
+    env = HumanoidCollabEnv(task="hug", fixed_standing=True, control_mode="arms_only")
+    try:
+        body_by_id = {
+            i: mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_BODY, i)
+            for i in range(env.model.nbody)
+        }
+        welded_bodies = set()
+        for eq_idx in range(env.model.neq):
+            obj1 = int(env.model.eq_obj1id[eq_idx])
+            obj2 = int(env.model.eq_obj2id[eq_idx])
+            n1 = body_by_id.get(obj1)
+            n2 = body_by_id.get(obj2)
+            if n1 is not None:
+                welded_bodies.add(n1)
+            if n2 is not None:
+                welded_bodies.add(n2)
+        assert "h0_lower_body" in welded_bodies
+        assert "h1_lower_body" in welded_bodies
+    finally:
+        env.close()
+
+
+def test_hug_arms_only_includes_abdomen_when_fixed_standing():
+    env = HumanoidCollabEnv(task="hug", fixed_standing=True, control_mode="arms_only")
+    try:
+        # 6 arm actuators + 2 abdomen actuators
+        assert env.action_space("h0").shape[0] == 8
+        h0_names = [
+            mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, int(i))
+            for i in env._control_actuator_idx["h0"]
+        ]
+        assert any(name is not None and "_abdomen_y" in name for name in h0_names)
+        assert any(name is not None and "_abdomen_z" in name for name in h0_names)
     finally:
         env.close()

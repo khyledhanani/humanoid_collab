@@ -31,7 +31,7 @@ class HumanoidCollabEnv(ParallelEnv):
         hold_target: Consecutive success-condition steps for completion
         stage: Curriculum stage
         physics_profile: MuJoCo physics profile ("default", "balanced", "train_fast")
-        fixed_standing: If True, weld both torsos to world (no locomotion).
+        fixed_standing: If True, use task-specific standing anchors (no locomotion).
         control_mode: "all" (18 actuators) or "arms_only" (6 arm actuators).
         observation_mode: "proprio" (vector), "rgb" (egocentric color image),
             or "gray" (egocentric grayscale image).
@@ -107,6 +107,7 @@ class HumanoidCollabEnv(ParallelEnv):
             task_actuator_additions=self.task_config.mjcf_actuator_additions(),
             physics_profile=self.physics_profile,
             fixed_standing=self.fixed_standing,
+            fixed_standing_mode=self._resolve_fixed_standing_mode(),
             spawn_half_distance=spawn_half_distance,
             h1_faces_h0=h1_faces_h0,
         )
@@ -582,7 +583,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 if self.control_mode == "all":
                     idx.append(i)
                     continue
-                if self._is_arm_actuator_name(act_name):
+                if self._is_actuator_selected_for_arms_only(act_name):
                     idx.append(i)
             if len(idx) == 0:
                 raise ValueError(
@@ -605,6 +606,27 @@ class HumanoidCollabEnv(ParallelEnv):
             "_right_elbow",
         )
         return any(token in act_name for token in arm_tokens)
+
+    @staticmethod
+    def _is_abdomen_actuator_name(act_name: str) -> bool:
+        return ("_abdomen_y" in act_name) or ("_abdomen_z" in act_name)
+
+    def _is_actuator_selected_for_arms_only(self, act_name: str) -> bool:
+        # For fixed-standing hug, allow abdomen control so torsos can lean/wrap
+        # while lower body remains anchored.
+        if (
+            self.task_name == "hug"
+            and self.fixed_standing
+            and self.control_mode == "arms_only"
+            and self._is_abdomen_actuator_name(act_name)
+        ):
+            return True
+        return self._is_arm_actuator_name(act_name)
+
+    def _resolve_fixed_standing_mode(self) -> str:
+        if self.task_name == "hug":
+            return "lower_body"
+        return "torso"
 
     def _enforce_fixed_standing_roots(self) -> None:
         """Pin root state to model initial state for fixed-standing setups."""

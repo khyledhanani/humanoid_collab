@@ -195,7 +195,7 @@ class TaskConfig(ABC):
         that may affect reward shaping (e.g., whether locomotion is needed).
 
         Args:
-            fixed_standing: Whether torsos are welded to world
+            fixed_standing: Whether task uses fixed-standing anchors (no locomotion)
             control_mode: "all" or "arms_only"
         """
         # Default implementation stores the flags; subclasses can override
