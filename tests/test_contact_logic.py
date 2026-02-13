@@ -56,6 +56,9 @@ class TestHugContactKeys:
             "h0_arm_h1_torso", "h1_arm_h0_torso",
             "h0_l_arm_h1_torso", "h0_r_arm_h1_torso",
             "h1_l_arm_h0_torso", "h1_r_arm_h0_torso",
+            "h0_hand_h1_torso", "h1_hand_h0_torso",
+            "h0_l_hand_h1_torso", "h0_r_hand_h1_torso",
+            "h1_l_hand_h0_torso", "h1_r_hand_h0_torso",
         ]
         for key in expected_keys:
             assert key in contact_info, f"Missing key '{key}' in hug contacts"

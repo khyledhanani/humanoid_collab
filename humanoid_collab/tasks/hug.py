@@ -20,8 +20,8 @@ from humanoid_collab.utils.kinematics import (
 # Hug curriculum for fixed-standing:
 #   stage 0: hand placement and pose organization
 #   stage 1: add initial contact requirement
-#   stage 2: require bilateral contact quality
-#   stage 3: tighten hold quality / wrap quality
+#   stage 2: require bilateral contact quality + hand-on-back contact bonus
+#   stage 3: tighten hold quality / wrap quality + stronger hand-on-back bonus
 _HUG_STAGES = {
     0: dict(
         w_dist=0.45,
@@ -29,6 +29,7 @@ _HUG_STAGES = {
         w_stab=0.05,
         w_contact=1.0,
         w_hand=1.3,
+        w_hand_back_contact=0.0,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.005,
@@ -41,6 +42,7 @@ _HUG_STAGES = {
         w_stab=0.08,
         w_contact=2.0,
         w_hand=1.2,
+        w_hand_back_contact=0.0,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.005,
@@ -53,6 +55,7 @@ _HUG_STAGES = {
         w_stab=0.1,
         w_contact=3.2,
         w_hand=1.0,
+        w_hand_back_contact=1.0,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.007,
@@ -65,6 +68,7 @@ _HUG_STAGES = {
         w_stab=0.12,
         w_contact=4.2,
         w_hand=0.7,
+        w_hand_back_contact=1.4,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.01,
@@ -81,6 +85,7 @@ V_THRESH_FINAL = 0.90
 TILT_THRESH = 0.5
 HAND_ALPHA = 4.0
 BETA_SPEED = 2.0
+HAND_BACKSIDE_X_MAX = -0.01
 
 
 @register_task
@@ -108,6 +113,12 @@ class HugTask(TaskConfig):
             ("h0_r_arm_h1_torso", "h0_r_arm", "h1_torso"),
             ("h1_l_arm_h0_torso", "h1_l_arm", "h0_torso"),
             ("h1_r_arm_h0_torso", "h1_r_arm", "h0_torso"),
+            ("h0_hand_h1_torso", "h0_hand", "h1_torso"),
+            ("h1_hand_h0_torso", "h1_hand", "h0_torso"),
+            ("h0_l_hand_h1_torso", "h0_l_hand", "h1_torso"),
+            ("h0_r_hand_h1_torso", "h0_r_hand", "h1_torso"),
+            ("h1_l_hand_h0_torso", "h1_l_hand", "h0_torso"),
+            ("h1_r_hand_h0_torso", "h1_r_hand", "h0_torso"),
         ]
 
     def randomize_state(self, model, data, id_cache, rng):
@@ -299,6 +310,20 @@ class HugTask(TaskConfig):
             "hand_back_max": hand_max,
         }
 
+    def _get_hand_back_contact_dist_thresh(self) -> float:
+        """Distance threshold used to qualify hand-on-back contact quality."""
+        if self._fixed_standing:
+            by_stage = {0: 0.34, 1: 0.34, 2: 0.32, 3: 0.30}
+        else:
+            by_stage = {0: 0.32, 1: 0.32, 2: 0.30, 3: 0.28}
+        return by_stage.get(self._stage, by_stage[0])
+
+    @staticmethod
+    def _hand_local_x_wrt_torso(hand_world: np.ndarray, torso_pos: np.ndarray, torso_xmat: np.ndarray) -> float:
+        """Return hand x-position in torso local frame; negative x is behind torso."""
+        hand_local = torso_xmat.T @ (hand_world - torso_pos)
+        return float(hand_local[0])
+
     def compute_reward(self, data, id_cache, contact_info, ctrl,
                        contact_force_proxy, hold_steps, success, fallen):
         w = self._weights
@@ -383,6 +408,57 @@ class HugTask(TaskConfig):
             info["hand_back_mean"] = hand_d["hand_back_mean"]
             info["hand_back_max"] = hand_d["hand_back_max"]
             info["r_hand_to_back"] = 0.0
+
+        # Extra bonus for genuine hand-on-back contact quality (stages 2+).
+        hand_back_contact_thresh = self._get_hand_back_contact_dist_thresh()
+        h0_torso_pos = id_cache.get_torso_xpos(data, "h0")
+        h1_torso_pos = id_cache.get_torso_xpos(data, "h1")
+        h0_torso_xmat = id_cache.get_torso_xmat(data, "h0")
+        h1_torso_xmat = id_cache.get_torso_xmat(data, "h1")
+        h0l = id_cache.get_site_xpos(data, "h0_lhand")
+        h0r = id_cache.get_site_xpos(data, "h0_rhand")
+        h1l = id_cache.get_site_xpos(data, "h1_lhand")
+        h1r = id_cache.get_site_xpos(data, "h1_rhand")
+        h0_l_local_x_on_h1 = self._hand_local_x_wrt_torso(h0l, h1_torso_pos, h1_torso_xmat)
+        h0_r_local_x_on_h1 = self._hand_local_x_wrt_torso(h0r, h1_torso_pos, h1_torso_xmat)
+        h1_l_local_x_on_h0 = self._hand_local_x_wrt_torso(h1l, h0_torso_pos, h0_torso_xmat)
+        h1_r_local_x_on_h0 = self._hand_local_x_wrt_torso(h1r, h0_torso_pos, h0_torso_xmat)
+        h0_l_on_back = (
+            bool(contact_info.get("h0_l_hand_h1_torso", False))
+            and (hand_d["d_h0l_h1b"] < hand_back_contact_thresh)
+            and (h0_l_local_x_on_h1 < HAND_BACKSIDE_X_MAX)
+        )
+        h0_r_on_back = (
+            bool(contact_info.get("h0_r_hand_h1_torso", False))
+            and (hand_d["d_h0r_h1b"] < hand_back_contact_thresh)
+            and (h0_r_local_x_on_h1 < HAND_BACKSIDE_X_MAX)
+        )
+        h1_l_on_back = (
+            bool(contact_info.get("h1_l_hand_h0_torso", False))
+            and (hand_d["d_h1l_h0b"] < hand_back_contact_thresh)
+            and (h1_l_local_x_on_h0 < HAND_BACKSIDE_X_MAX)
+        )
+        h1_r_on_back = (
+            bool(contact_info.get("h1_r_hand_h0_torso", False))
+            and (hand_d["d_h1r_h0b"] < hand_back_contact_thresh)
+            and (h1_r_local_x_on_h0 < HAND_BACKSIDE_X_MAX)
+        )
+        hand_back_contact_count = float(
+            int(h0_l_on_back) + int(h0_r_on_back) + int(h1_l_on_back) + int(h1_r_on_back)
+        )
+        hand_back_contact_ratio = hand_back_contact_count / 4.0
+        w_hand_back_contact = float(w.get("w_hand_back_contact", 0.0))
+        r_hand_back_contact = w_hand_back_contact * hand_back_contact_ratio
+        total += r_hand_back_contact
+        info["hand_back_contact_dist_thresh"] = hand_back_contact_thresh
+        info["hand_backside_x_max"] = HAND_BACKSIDE_X_MAX
+        info["h0_lhand_local_x_on_h1"] = h0_l_local_x_on_h1
+        info["h0_rhand_local_x_on_h1"] = h0_r_local_x_on_h1
+        info["h1_lhand_local_x_on_h0"] = h1_l_local_x_on_h0
+        info["h1_rhand_local_x_on_h0"] = h1_r_local_x_on_h0
+        info["hand_back_contact_count"] = hand_back_contact_count
+        info["hand_back_contact_ratio"] = hand_back_contact_ratio
+        info["r_hand_back_contact"] = r_hand_back_contact
 
         # Time pressure to prefer completing the task quickly over farming shaping.
         r_time = float(w.get("w_time", 0.0))

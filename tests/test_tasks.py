@@ -35,6 +35,12 @@ class TestHugTask:
             config.set_stage(stage)
             weights = config.get_weights_dict()
             assert isinstance(weights, dict)
+        config.set_stage(1)
+        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) == 0.0
+        config.set_stage(2)
+        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) > 0.0
+        config.set_stage(3)
+        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) > 0.0
 
     def test_hug_reward_computation(self):
         env = HumanoidCollabEnv(task="hug")
@@ -45,6 +51,17 @@ class TestHugTask:
             assert isinstance(rewards[agent], float)
             assert "total_reward" in infos[agent]
         env.close()
+
+    def test_hug_backside_classifier_local_x(self):
+        config = get_task("hug")
+        torso_pos = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        torso_xmat = np.eye(3, dtype=np.float64)
+        back_hand = np.array([-0.08, 0.0, 0.0], dtype=np.float64)
+        front_hand = np.array([0.08, 0.0, 0.0], dtype=np.float64)
+        back_x = config._hand_local_x_wrt_torso(back_hand, torso_pos, torso_xmat)
+        front_x = config._hand_local_x_wrt_torso(front_hand, torso_pos, torso_xmat)
+        assert back_x < 0.0
+        assert front_x > 0.0
 
 
 class TestHandshakeTask:
