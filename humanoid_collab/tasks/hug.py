@@ -60,7 +60,7 @@ _HUG_STAGES = {
         w_energy=-0.001,
         w_impact=-0.007,
         w_fall=-25.0,
-        r_success=360.0,
+        r_success=8000.0,
     ),
     3: dict(
         w_dist=0.25,
@@ -73,7 +73,7 @@ _HUG_STAGES = {
         w_energy=-0.001,
         w_impact=-0.01,
         w_fall=-25.0,
-        r_success=420.0,
+        r_success=1000.0,
     ),
 }
 
