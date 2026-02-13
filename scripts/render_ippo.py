@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from typing import Dict
 
 import numpy as np
@@ -13,6 +14,7 @@ from humanoid_collab import HumanoidCollabEnv
 
 
 AGENTS = ("h0", "h1")
+HUMAN_RENDER_DELAY_S = 0.12
 
 
 class ActorCritic(nn.Module):
@@ -103,6 +105,7 @@ def main() -> None:
 
                 obs, rewards, terminations, truncations, infos = env.step(actions)
                 env.render()
+                time.sleep(HUMAN_RENDER_DELAY_S)
                 ep_ret += float(rewards["h0"])
                 steps += 1
                 done = bool(terminations["h0"] or truncations["h0"])

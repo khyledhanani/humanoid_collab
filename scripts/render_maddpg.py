@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -15,6 +16,7 @@ from humanoid_collab.vision import load_frozen_encoder_from_vae_checkpoint
 
 
 AGENTS = ("h0", "h1")
+HUMAN_RENDER_DELAY_S = 0.12
 
 
 class Actor(nn.Module):
@@ -255,6 +257,7 @@ def main() -> None:
                 obs, rewards, terminations, truncations, infos = env.step(actions)
                 policy_obs = _transform_obs(obs, infos, adapter)
                 env.render()
+                time.sleep(HUMAN_RENDER_DELAY_S)
                 ep_ret += float(rewards["h0"])
                 steps += 1
                 done = bool(terminations["h0"] or truncations["h0"])

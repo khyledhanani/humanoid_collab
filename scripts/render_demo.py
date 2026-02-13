@@ -1,10 +1,14 @@
 """Render a demo of any task with random actions."""
 
 import argparse
+import time
 
 from humanoid_collab.env import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.tasks.registry import available_tasks
+
+HUMAN_RENDER_DELAY_S = 0.12
+VIDEO_RENDER_FPS = 12
 
 
 def _make_env(
@@ -68,6 +72,7 @@ def render_human(
         actions = {agent: env.action_space(agent).sample() for agent in env.agents}
         obs, rewards, terminations, truncations, infos = env.step(actions)
         env.render()
+        time.sleep(HUMAN_RENDER_DELAY_S)
         step += 1
 
     env.close()
@@ -119,7 +124,7 @@ def render_video(
     env.close()
 
     if frames:
-        imageio.mimsave(output, frames, fps=40)
+        imageio.mimsave(output, frames, fps=VIDEO_RENDER_FPS)
         print(f"Saved {len(frames)} frames to {output}")
     else:
         print("No frames captured.")
