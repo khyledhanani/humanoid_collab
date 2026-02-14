@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -36,7 +37,13 @@ class Actor(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render MADDPG checkpoint in humanoid_collab.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints/maddpg_handshake_fixed_arms",
+        help="Directory used to resolve default checkpoint path as <checkpoint-dir>/latest.pt.",
+    )
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--noise", type=float, default=0.0, help="Optional exploration noise at eval time.")
@@ -78,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         help="Override fixed-standing behavior. Use --no-fixed-standing for locomotion.",
     )
     return parser.parse_args()
+
+
+def _resolve_checkpoint_path(args: argparse.Namespace) -> str:
+    if args.checkpoint is not None:
+        path = str(args.checkpoint)
+    else:
+        path = os.path.join(str(args.checkpoint_dir), "latest.pt")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Checkpoint not found at '{path}'. Pass --checkpoint explicitly or set --checkpoint-dir."
+        )
+    return path
 
 
 def make_env_from_ckpt_args(train_args: Dict[str, object], args: argparse.Namespace):
@@ -203,7 +222,9 @@ def _transform_obs(
 
 def main() -> None:
     args = parse_args()
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint_path = _resolve_checkpoint_path(args)
+    print(f"loading checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
 
     train_args = ckpt.get("args", {})
     obs_dim = int(ckpt["obs_dim"])

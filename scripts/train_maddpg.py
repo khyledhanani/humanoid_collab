@@ -1568,6 +1568,7 @@ def train(args: argparse.Namespace) -> None:
 
             if global_step - last_save_step >= args.save_every_steps or global_step >= args.total_steps:
                 ckpt_path = os.path.join(args.save_dir, f"maddpg_step_{global_step:07d}.pt")
+                latest_ckpt_path = os.path.join(args.save_dir, "latest.pt")
                 payload = {
                     "algo": "maddpg",
                     "args": vars(args),
@@ -1601,6 +1602,7 @@ def train(args: argparse.Namespace) -> None:
                         amp_disc_trainer.optimizer.state_dict() if amp_disc_trainer is not None else None
                     )
                 torch.save(payload, ckpt_path)
+                torch.save(payload, latest_ckpt_path)
                 last_save_step = global_step
 
     finally:
