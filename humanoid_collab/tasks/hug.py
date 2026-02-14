@@ -348,10 +348,16 @@ class HugTask(TaskConfig):
         h1_xmat = id_cache.get_torso_xmat(data, "h1")
         facing = compute_facing_alignment(get_forward_vector(h0_xmat), get_forward_vector(h1_xmat))
         proximity_gate = np.clip((1.2 - dist) / 1.2, 0.0, 1.0)
+        contact_proximity_gate = 1.0
+        if (not self._fixed_standing) and self._stage == 0:
+            # During locomotion-only stage 0, suppress contact shaping when far apart
+            # and ramp it in once agents get close enough to plausibly wrap.
+            contact_proximity_gate = np.clip((1.4 - dist) / 0.6, 0.0, 1.0)
         r_face = w["w_face"] * max(0.0, facing) * proximity_gate
         total += r_face
         info["facing_alignment"] = facing
         info["proximity_gate"] = proximity_gate
+        info["contact_proximity_gate"] = contact_proximity_gate
         info["r_facing"] = r_face
 
         # Stability reward
@@ -373,6 +379,7 @@ class HugTask(TaskConfig):
             + 0.75 * quality["dual_contact"]
             + 0.50 * quality["wrap_quality"]
         )
+        r_contact *= contact_proximity_gate
         total += r_contact
         info["side_contact_count"] = quality["side_contact_count"]
         info["directional_contact_count"] = quality["directional_contact_count"]
@@ -391,6 +398,7 @@ class HugTask(TaskConfig):
                 + np.exp(-HAND_ALPHA * hand_d["d_h1r_h0b"])
             ) / 4.0
             r_hand = w["w_hand"] * hand_r
+            r_hand *= contact_proximity_gate
             total += r_hand
             info["h0_lhand_to_h1_back"] = hand_d["d_h0l_h1b"]
             info["h0_rhand_to_h1_back"] = hand_d["d_h0r_h1b"]
@@ -449,6 +457,7 @@ class HugTask(TaskConfig):
         hand_back_contact_ratio = hand_back_contact_count / 4.0
         w_hand_back_contact = float(w.get("w_hand_back_contact", 0.0))
         r_hand_back_contact = w_hand_back_contact * hand_back_contact_ratio
+        r_hand_back_contact *= contact_proximity_gate
         total += r_hand_back_contact
         info["hand_back_contact_dist_thresh"] = hand_back_contact_thresh
         info["hand_backside_x_max"] = HAND_BACKSIDE_X_MAX

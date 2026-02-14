@@ -182,6 +182,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-reward-scale", type=float, default=2.0)
     parser.add_argument("--amp-clip-reward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp-approach-steps", type=int, default=500_000)
+    parser.add_argument("--amp-approach-progress-weight", type=float, default=20.0)
+    parser.add_argument("--amp-approach-heading-weight", type=float, default=0.15)
+    parser.add_argument("--amp-approach-distance-weight", type=float, default=0.75)
+    parser.add_argument("--amp-approach-distance-scale", type=float, default=1.5)
+    parser.add_argument("--amp-approach-progress-clip", type=float, default=0.05)
     parser.add_argument("--amp-weight-override", type=float, default=None)
     parser.add_argument("--amp-weight-stage0", type=float, default=0.40)
     parser.add_argument("--amp-weight-stage1", type=float, default=0.35)
@@ -466,6 +471,40 @@ def _mean_recent(values: List[float], n: int) -> float:
         return 0.0
     k = min(len(values), max(1, n))
     return float(np.mean(values[-k:]))
+
+
+def _compute_dense_approach_reward(
+    infos_list: List[Dict[str, Dict[str, Any]]],
+    prev_chest_dist: np.ndarray,
+    progress_clip: float,
+    progress_weight: float,
+    heading_weight: float,
+    distance_weight: float,
+    distance_scale: float,
+) -> np.ndarray:
+    reward = np.zeros((len(infos_list),), dtype=np.float32)
+    for env_idx, info_env in enumerate(infos_list):
+        h0_info = info_env.get("h0", {})
+        chest_dist = float(h0_info.get("chest_distance", np.nan))
+        facing = float(h0_info.get("facing_alignment", 0.0))
+
+        if np.isfinite(prev_chest_dist[env_idx]) and np.isfinite(chest_dist):
+            progress = float(prev_chest_dist[env_idx] - chest_dist)
+        else:
+            progress = 0.0
+        progress = float(np.clip(progress, -progress_clip, progress_clip))
+
+        heading = max(0.0, facing)
+        dist_shape = float(np.exp(-max(chest_dist, 0.0) / max(distance_scale, 1e-6)))
+
+        reward[env_idx] = (
+            progress_weight * progress
+            + heading_weight * heading
+            + distance_weight * dist_shape
+        )
+        prev_chest_dist[env_idx] = chest_dist
+
+    return reward
 
 
 def _amp_weight_for_stage(args: argparse.Namespace, stage: int) -> float:
@@ -964,6 +1003,8 @@ def train(args: argparse.Namespace) -> None:
     amp_disc_loss_hist: List[float] = []
     amp_d_real_hist: List[float] = []
     amp_d_fake_hist: List[float] = []
+    approach_reward_hist: List[float] = []
+    prev_chest_dist = np.full((args.num_envs,), np.nan, dtype=np.float32)
 
     amp_obs_current: Optional[Dict[str, np.ndarray]] = None
     if args.amp_enable:
@@ -1047,6 +1088,7 @@ def train(args: argparse.Namespace) -> None:
             num_envs=args.num_envs,
             adapter=obs_adapter,
         )
+        prev_chest_dist[:] = np.nan
         if args.amp_enable:
             amp_obs_current = _compute_amp_obs_batch(
                 raw_obs_batch=raw_obs_batch,
@@ -1174,16 +1216,22 @@ def train(args: argparse.Namespace) -> None:
                 task_weight = 1.0 - amp_weight
                 amp_weight_hist.append(float(amp_weight))
 
+                approach_reward = None
+                if in_approach_phase:
+                    approach_reward = _compute_dense_approach_reward(
+                        infos_list=infos_list,
+                        prev_chest_dist=prev_chest_dist,
+                        progress_clip=float(args.amp_approach_progress_clip),
+                        progress_weight=float(args.amp_approach_progress_weight),
+                        heading_weight=float(args.amp_approach_heading_weight),
+                        distance_weight=float(args.amp_approach_distance_weight),
+                        distance_scale=float(args.amp_approach_distance_scale),
+                    )
+                    approach_reward_hist.extend(approach_reward.tolist())
+
                 for agent in AGENTS:
-                    if in_approach_phase:
-                        approach_vals = []
-                        for info_env in infos_list:
-                            agent_info = info_env.get(agent, {})
-                            approach_vals.append(
-                                float(agent_info.get("r_distance", 0.0))
-                                + float(agent_info.get("r_facing", 0.0))
-                            )
-                        task_component = np.asarray(approach_vals, dtype=np.float32)
+                    if in_approach_phase and approach_reward is not None:
+                        task_component = approach_reward
                     else:
                         task_component = np.asarray(rewards_batch[agent], dtype=np.float32)
 
@@ -1197,6 +1245,8 @@ def train(args: argparse.Namespace) -> None:
                     del amp_reward_hist[:-max_amp_hist]
                 if len(amp_weight_hist) > max_amp_hist:
                     del amp_weight_hist[:-max_amp_hist]
+                if len(approach_reward_hist) > max_amp_hist:
+                    del approach_reward_hist[:-max_amp_hist]
 
                 amp_obs_current = _compute_amp_obs_batch(
                     raw_obs_batch=raw_next_obs_for_rollout,
@@ -1266,6 +1316,7 @@ def train(args: argparse.Namespace) -> None:
                 completed_successes.append(1.0 if reasons[env_idx] == "success" else 0.0)
                 ep_returns[env_idx] = 0.0
                 ep_lengths[env_idx] = 0
+                prev_chest_dist[env_idx] = np.nan
 
             obs_batch = next_obs_for_rollout
             global_step += args.num_envs
@@ -1412,6 +1463,7 @@ def train(args: argparse.Namespace) -> None:
                         num_envs=args.num_envs,
                         adapter=obs_adapter,
                     )
+                    prev_chest_dist[:] = np.nan
                     if args.amp_enable:
                         amp_obs_current = _compute_amp_obs_batch(
                             raw_obs_batch=raw_obs_batch,
@@ -1442,6 +1494,9 @@ def train(args: argparse.Namespace) -> None:
                 a0 = float(np.mean(actor_loss_hist["h0"][-100:])) if actor_loss_hist["h0"] else 0.0
                 a1 = float(np.mean(actor_loss_hist["h1"][-100:])) if actor_loss_hist["h1"] else 0.0
                 amp_reward_mean = float(np.mean(amp_reward_hist[-2000:])) if amp_reward_hist else 0.0
+                approach_reward_mean = (
+                    float(np.mean(approach_reward_hist[-2000:])) if approach_reward_hist else 0.0
+                )
                 amp_weight_now = (
                     0.5 if global_step < args.amp_approach_steps else _amp_weight_for_stage(args, current_stage)
                 )
@@ -1460,6 +1515,8 @@ def train(args: argparse.Namespace) -> None:
                         f" amp_w={amp_weight_now:.2f} amp_r={amp_reward_mean:.3f} "
                         f"d_loss={amp_disc_loss:.4f} d_real={amp_d_real:.3f} d_fake={amp_d_fake:.3f}"
                     )
+                    if global_step < args.amp_approach_steps:
+                        msg += f" approach_r={approach_reward_mean:.3f}"
                 print(msg)
                 if stage_up_msg is not None:
                     print(stage_up_msg)
@@ -1474,6 +1531,7 @@ def train(args: argparse.Namespace) -> None:
                 if args.amp_enable:
                     algo_metrics["amp_weight"] = float(amp_weight_now)
                     algo_metrics["amp_reward_mean"] = float(amp_reward_mean)
+                    algo_metrics["approach_reward_mean"] = float(approach_reward_mean)
                     algo_metrics["amp_disc_loss"] = float(amp_disc_loss)
                     algo_metrics["amp_d_real"] = float(amp_d_real)
                     algo_metrics["amp_d_fake"] = float(amp_d_fake)
