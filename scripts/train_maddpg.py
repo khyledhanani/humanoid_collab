@@ -30,6 +30,10 @@ from humanoid_collab import (
     SharedMemHumanoidCollabVecEnv,
     SubprocHumanoidCollabVecEnv,
 )
+from humanoid_collab.amp.amp_obs import AMPObsBuilder, quat_to_mat
+from humanoid_collab.amp.discriminator import AMPDiscriminator, AMPDiscriminatorTrainer
+from humanoid_collab.amp.motion_buffer import MotionReplayBuffer, PolicyTransitionBuffer
+from humanoid_collab.amp.motion_data import load_motion_dataset
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.vision import load_frozen_encoder_from_vae_checkpoint
 from humanoid_collab.utils.exp_logging import ExperimentLogger
@@ -157,6 +161,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-group", type=str, default="maddpg")
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
     parser.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
+
+    parser.add_argument("--amp-enable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--amp-motion-data-dir", type=str, default=None)
+    parser.add_argument(
+        "--amp-motion-categories",
+        type=str,
+        nargs="+",
+        default=["standing", "walking", "reaching"],
+    )
+    parser.add_argument("--amp-disc-checkpoint", type=str, default=None)
+    parser.add_argument("--amp-disc-hidden-sizes", type=int, nargs="+", default=[1024, 512])
+    parser.add_argument("--amp-disc-lr", type=float, default=1e-4)
+    parser.add_argument("--amp-disc-batch-size", type=int, default=1024)
+    parser.add_argument("--amp-disc-updates", type=int, default=5)
+    parser.add_argument("--amp-lambda-gp", type=float, default=10.0)
+    parser.add_argument("--amp-warmup-steps", type=int, default=50_000)
+    parser.add_argument("--amp-policy-buffer-size", type=int, default=1_000_000)
+    parser.add_argument("--amp-freeze-discriminator", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--amp-reward-scale", type=float, default=2.0)
+    parser.add_argument("--amp-clip-reward", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp-approach-steps", type=int, default=500_000)
+    parser.add_argument("--amp-weight-override", type=float, default=None)
+    parser.add_argument("--amp-weight-stage0", type=float, default=0.40)
+    parser.add_argument("--amp-weight-stage1", type=float, default=0.35)
+    parser.add_argument("--amp-weight-stage2", type=float, default=0.30)
+    parser.add_argument("--amp-weight-stage3", type=float, default=0.25)
+    parser.add_argument("--amp-include-root-height", action=argparse.BooleanOptionalAction, default=True)
 
     return parser.parse_args()
 
@@ -437,7 +468,148 @@ def _mean_recent(values: List[float], n: int) -> float:
     return float(np.mean(values[-k:]))
 
 
+def _amp_weight_for_stage(args: argparse.Namespace, stage: int) -> float:
+    if args.amp_weight_override is not None:
+        return float(args.amp_weight_override)
+    by_stage = {
+        0: float(args.amp_weight_stage0),
+        1: float(args.amp_weight_stage1),
+        2: float(args.amp_weight_stage2),
+        3: float(args.amp_weight_stage3),
+    }
+    return float(by_stage.get(int(stage), args.amp_weight_stage3))
+
+
+def _extract_root_height_from_infos(
+    infos_list: List[Dict[str, Dict[str, Any]]],
+    num_envs: int,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+) -> Dict[str, np.ndarray]:
+    if done_mask is None:
+        done_mask = np.zeros((num_envs,), dtype=np.bool_)
+    out: Dict[str, List[float]] = {agent: [] for agent in AGENTS}
+    for env_idx in range(num_envs):
+        info_env = infos_list[env_idx]
+        done_flag = bool(done_mask[env_idx])
+        for agent in AGENTS:
+            agent_info = info_env.get(agent, {})
+            info_src = agent_info
+            if use_reset_info_for_done and done_flag:
+                reset_info = agent_info.get("reset_info")
+                if isinstance(reset_info, dict):
+                    info_src = reset_info
+            if "root_height" not in info_src:
+                raise KeyError("Expected 'root_height' in infos payload for AMP training.")
+            out[agent].append(float(info_src["root_height"]))
+    return {
+        agent: np.asarray(values, dtype=np.float32)
+        for agent, values in out.items()
+    }
+
+
+def _extract_proprio_for_amp(
+    raw_obs_batch: Dict[str, np.ndarray],
+    infos_payload: Any,
+    num_envs: int,
+    observation_mode: str,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+) -> Dict[str, np.ndarray]:
+    if observation_mode == "proprio":
+        return {agent: np.asarray(raw_obs_batch[agent], dtype=np.float32) for agent in AGENTS}
+    infos_list = _normalize_infos_payload(infos_payload, num_envs)
+    return _extract_proprio_from_infos(
+        infos_list=infos_list,
+        num_envs=num_envs,
+        done_mask=done_mask,
+        use_reset_info_for_done=use_reset_info_for_done,
+    )
+
+
+def _build_amp_obs_from_proprio(
+    proprio_batch: Dict[str, np.ndarray],
+    root_height_batch: Dict[str, np.ndarray],
+    joint_qpos_dim: int,
+    joint_qvel_dim: int,
+    include_root_height: bool,
+) -> Dict[str, np.ndarray]:
+    base_dim = joint_qpos_dim + joint_qvel_dim + 4 + 3
+    out: Dict[str, np.ndarray] = {}
+    for agent in AGENTS:
+        proprio = np.asarray(proprio_batch[agent], dtype=np.float32)
+        if proprio.ndim != 2:
+            raise ValueError(f"Expected 2D proprio batch for {agent}, got {proprio.shape}")
+        if proprio.shape[1] < base_dim:
+            raise ValueError(
+                f"Proprio dim for {agent} is {proprio.shape[1]}, expected at least {base_dim}."
+            )
+        n = proprio.shape[0]
+        offset = 0
+        joint_qpos = proprio[:, offset : offset + joint_qpos_dim]
+        offset += joint_qpos_dim
+        joint_qvel = proprio[:, offset : offset + joint_qvel_dim]
+        offset += joint_qvel_dim
+        root_quat = proprio[:, offset : offset + 4]
+        offset += 4
+        root_angvel = proprio[:, offset : offset + 3]
+
+        fwd = np.zeros((n, 3), dtype=np.float32)
+        up = np.zeros((n, 3), dtype=np.float32)
+        for idx in range(n):
+            xmat = quat_to_mat(root_quat[idx])
+            fwd[idx] = xmat[:, 0].astype(np.float32)
+            up[idx] = xmat[:, 2].astype(np.float32)
+
+        parts: List[np.ndarray] = [joint_qpos, joint_qvel]
+        if include_root_height:
+            parts.append(root_height_batch[agent].reshape(-1, 1))
+        parts.extend([fwd, up, root_angvel])
+        out[agent] = np.concatenate(parts, axis=-1).astype(np.float32)
+    return out
+
+
+def _compute_amp_obs_batch(
+    *,
+    raw_obs_batch: Dict[str, np.ndarray],
+    infos_payload: Any,
+    num_envs: int,
+    observation_mode: str,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+    joint_qpos_dim: int,
+    joint_qvel_dim: int,
+    include_root_height: bool,
+) -> Dict[str, np.ndarray]:
+    infos_list = _normalize_infos_payload(infos_payload, num_envs)
+    proprio = _extract_proprio_for_amp(
+        raw_obs_batch=raw_obs_batch,
+        infos_payload=infos_payload,
+        num_envs=num_envs,
+        observation_mode=observation_mode,
+        done_mask=done_mask,
+        use_reset_info_for_done=use_reset_info_for_done,
+    )
+    root_height = _extract_root_height_from_infos(
+        infos_list=infos_list,
+        num_envs=num_envs,
+        done_mask=done_mask,
+        use_reset_info_for_done=use_reset_info_for_done,
+    )
+    return _build_amp_obs_from_proprio(
+        proprio_batch=proprio,
+        root_height_batch=root_height,
+        joint_qpos_dim=joint_qpos_dim,
+        joint_qvel_dim=joint_qvel_dim,
+        include_root_height=include_root_height,
+    )
+
+
 def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
+    emit_proprio_info = bool(
+        args.observation_mode in {"rgb", "gray"}
+        and (args.vision_use_proprio or args.amp_enable)
+    )
     return dict(
         task=args.task,
         stage=int(stage),
@@ -450,7 +622,7 @@ def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
         observation_mode=args.observation_mode,
         obs_rgb_width=int(args.obs_rgb_width),
         obs_rgb_height=int(args.obs_rgb_height),
-        emit_proprio_info=bool(args.observation_mode in {"rgb", "gray"} and args.vision_use_proprio),
+        emit_proprio_info=emit_proprio_info,
     )
 
 
@@ -594,6 +766,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("exploration noise values must be non-negative")
     if args.total_steps <= 0:
         raise ValueError("--total-steps must be > 0")
+    if args.amp_enable and args.task != "hug":
+        raise ValueError("--amp-enable currently supports --task hug only.")
+    if args.amp_enable and not args.amp_motion_data_dir:
+        raise ValueError("--amp-enable requires --amp-motion-data-dir.")
 
     set_seed(args.seed)
     torch.set_num_threads(args.torch_threads)
@@ -638,6 +814,82 @@ def train(args: argparse.Namespace) -> None:
     act_dim = int(env.action_space("h0").shape[0])
     n_agents = len(AGENTS)
     joint_input_dim = n_agents * (obs_dim + act_dim)
+
+    amp_motion_buffer: Optional[MotionReplayBuffer] = None
+    amp_policy_buffer: Optional[PolicyTransitionBuffer] = None
+    amp_discriminator: Optional[AMPDiscriminator] = None
+    amp_disc_trainer: Optional[AMPDiscriminatorTrainer] = None
+    amp_joint_qpos_dim = 0
+    amp_joint_qvel_dim = 0
+    amp_obs_dim = 0
+
+    if args.amp_enable:
+        motion_dataset = load_motion_dataset(
+            args.amp_motion_data_dir,
+            categories=tuple(args.amp_motion_categories),
+        )
+        if motion_dataset.num_clips <= 0:
+            env.close()
+            raise RuntimeError("No motion clips loaded for AMP.")
+        sample_clip = motion_dataset.clips[0]
+        nq_agent = int(sample_clip.qpos.shape[1])
+        nv_agent = int(sample_clip.qvel.shape[1])
+        amp_joint_qpos_dim = nq_agent - 7
+        amp_joint_qvel_dim = nv_agent - 6
+
+        if isinstance(env, HumanoidCollabEnv):
+            amp_obs_builder = AMPObsBuilder(
+                id_cache=env.id_cache,
+                include_root_height=bool(args.amp_include_root_height),
+                include_root_orientation=True,
+                include_joint_positions=True,
+                include_joint_velocities=True,
+            )
+        else:
+            tmp_kwargs = _make_env_kwargs(args, current_stage)
+            tmp_kwargs["observation_mode"] = "proprio"
+            tmp_kwargs["emit_proprio_info"] = False
+            tmp_env = HumanoidCollabEnv(**tmp_kwargs)
+            try:
+                amp_obs_builder = AMPObsBuilder(
+                    id_cache=tmp_env.id_cache,
+                    include_root_height=bool(args.amp_include_root_height),
+                    include_root_orientation=True,
+                    include_joint_positions=True,
+                    include_joint_velocities=True,
+                )
+            finally:
+                tmp_env.close()
+
+        amp_motion_buffer = MotionReplayBuffer(motion_dataset, amp_obs_builder)
+        amp_obs_dim = int(amp_motion_buffer.obs_dim)
+        amp_policy_buffer = PolicyTransitionBuffer(
+            capacity=int(args.amp_policy_buffer_size),
+            obs_dim=amp_obs_dim,
+        )
+
+        amp_discriminator = AMPDiscriminator(
+            obs_dim=amp_obs_dim,
+            hidden_sizes=tuple(args.amp_disc_hidden_sizes),
+        )
+        amp_discriminator.to(device)
+        if not args.amp_freeze_discriminator:
+            amp_disc_trainer = AMPDiscriminatorTrainer(
+                discriminator=amp_discriminator,
+                lr=args.amp_disc_lr,
+                lambda_gp=args.amp_lambda_gp,
+                n_updates=args.amp_disc_updates,
+                device=str(device),
+            )
+        if args.amp_disc_checkpoint:
+            amp_ckpt = torch.load(args.amp_disc_checkpoint, map_location=device)
+            amp_state = amp_ckpt["discriminator"] if "discriminator" in amp_ckpt else amp_ckpt
+            amp_discriminator.load_state_dict(amp_state)
+            if amp_disc_trainer is not None and isinstance(amp_ckpt, dict):
+                disc_opt = amp_ckpt.get("disc_optimizer") or amp_ckpt.get("optimizer")
+                if disc_opt is not None:
+                    amp_disc_trainer.optimizer.load_state_dict(disc_opt)
+        amp_discriminator.eval()
 
     actors: Dict[str, Actor] = {}
     critics: Dict[str, Critic] = {}
@@ -707,6 +959,25 @@ def train(args: argparse.Namespace) -> None:
     hug_contact_any_hist: List[float] = []
     hug_dual_contact_hist: List[float] = []
     hug_hand_back_mean_hist: List[float] = []
+    amp_reward_hist: List[float] = []
+    amp_weight_hist: List[float] = []
+    amp_disc_loss_hist: List[float] = []
+    amp_d_real_hist: List[float] = []
+    amp_d_fake_hist: List[float] = []
+
+    amp_obs_current: Optional[Dict[str, np.ndarray]] = None
+    if args.amp_enable:
+        amp_obs_current = _compute_amp_obs_batch(
+            raw_obs_batch=raw_obs_batch,
+            infos_payload=reset_infos,
+            num_envs=args.num_envs,
+            observation_mode=args.observation_mode,
+            done_mask=None,
+            use_reset_info_for_done=False,
+            joint_qpos_dim=amp_joint_qpos_dim,
+            joint_qvel_dim=amp_joint_qvel_dim,
+            include_root_height=bool(args.amp_include_root_height),
+        )
 
     if args.resume_from is not None:
         if not os.path.isfile(args.resume_from):
@@ -749,6 +1020,16 @@ def train(args: argparse.Namespace) -> None:
             if "critic_optim" in ckpt and agent in ckpt["critic_optim"]:
                 critic_optim[agent].load_state_dict(ckpt["critic_optim"][agent])
 
+        if args.amp_enable and amp_discriminator is not None:
+            if "amp_discriminator" in ckpt:
+                amp_discriminator.load_state_dict(ckpt["amp_discriminator"])
+            if (
+                amp_disc_trainer is not None
+                and "amp_disc_optimizer" in ckpt
+                and ckpt["amp_disc_optimizer"] is not None
+            ):
+                amp_disc_trainer.optimizer.load_state_dict(ckpt["amp_disc_optimizer"])
+
         global_step = int(ckpt.get("global_step", 0))
         collector_iter = int(ckpt.get("collector_iter", 0))
         grad_updates = int(ckpt.get("grad_updates", 0))
@@ -766,6 +1047,18 @@ def train(args: argparse.Namespace) -> None:
             num_envs=args.num_envs,
             adapter=obs_adapter,
         )
+        if args.amp_enable:
+            amp_obs_current = _compute_amp_obs_batch(
+                raw_obs_batch=raw_obs_batch,
+                infos_payload=reset_infos,
+                num_envs=args.num_envs,
+                observation_mode=args.observation_mode,
+                done_mask=None,
+                use_reset_info_for_done=False,
+                joint_qpos_dim=amp_joint_qpos_dim,
+                joint_qvel_dim=amp_joint_qvel_dim,
+                include_root_height=bool(args.amp_include_root_height),
+            )
         print(
             f"resumed from {args.resume_from}: "
             f"global_step={global_step} stage={current_stage} "
@@ -786,6 +1079,7 @@ def train(args: argparse.Namespace) -> None:
         while global_step < args.total_steps:
             collector_iter += 1
             current_noise = _noise_std(global_step)
+            amp_disc_metrics = {"disc_loss": 0.0, "d_real": 0.0, "d_fake": 0.0}
             actions_batch = _collect_actions(
                 obs_batch=obs_batch,
                 actors=actors,
@@ -839,6 +1133,82 @@ def train(args: argparse.Namespace) -> None:
                     for agent in AGENTS
                 }
                 rollout_infos_payload = infos_list
+
+            if args.amp_enable:
+                if amp_obs_current is None or amp_discriminator is None or amp_policy_buffer is None:
+                    raise RuntimeError("AMP is enabled but AMP components are not initialized.")
+
+                amp_obs_t = amp_obs_current
+                amp_obs_t1_for_buffer = _compute_amp_obs_batch(
+                    raw_obs_batch=raw_next_obs_for_buffer,
+                    infos_payload=infos_list,
+                    num_envs=args.num_envs,
+                    observation_mode=args.observation_mode,
+                    done_mask=done_mask,
+                    use_reset_info_for_done=False,
+                    joint_qpos_dim=amp_joint_qpos_dim,
+                    joint_qvel_dim=amp_joint_qvel_dim,
+                    include_root_height=bool(args.amp_include_root_height),
+                )
+
+                amp_policy_buffer.add_batch(
+                    np.concatenate([amp_obs_t["h0"], amp_obs_t["h1"]], axis=0),
+                    np.concatenate([amp_obs_t1_for_buffer["h0"], amp_obs_t1_for_buffer["h1"]], axis=0),
+                )
+
+                amp_style_rewards: Dict[str, np.ndarray] = {}
+                for agent in AGENTS:
+                    obs_t_t = torch.as_tensor(amp_obs_t[agent], dtype=torch.float32, device=device)
+                    obs_t1_t = torch.as_tensor(amp_obs_t1_for_buffer[agent], dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        r_style = amp_discriminator.compute_reward(
+                            obs_t_t,
+                            obs_t1_t,
+                            clip_reward=bool(args.amp_clip_reward),
+                            reward_scale=float(args.amp_reward_scale),
+                        )
+                    amp_style_rewards[agent] = r_style.detach().cpu().numpy().astype(np.float32)
+
+                in_approach_phase = bool(global_step < args.amp_approach_steps)
+                amp_weight = 0.5 if in_approach_phase else _amp_weight_for_stage(args, current_stage)
+                task_weight = 1.0 - amp_weight
+                amp_weight_hist.append(float(amp_weight))
+
+                for agent in AGENTS:
+                    if in_approach_phase:
+                        approach_vals = []
+                        for info_env in infos_list:
+                            agent_info = info_env.get(agent, {})
+                            approach_vals.append(
+                                float(agent_info.get("r_distance", 0.0))
+                                + float(agent_info.get("r_facing", 0.0))
+                            )
+                        task_component = np.asarray(approach_vals, dtype=np.float32)
+                    else:
+                        task_component = np.asarray(rewards_batch[agent], dtype=np.float32)
+
+                    rewards_batch[agent] = (
+                        amp_weight * amp_style_rewards[agent] + task_weight * task_component
+                    ).astype(np.float32)
+                    amp_reward_hist.extend(amp_style_rewards[agent].tolist())
+
+                max_amp_hist = 20_000
+                if len(amp_reward_hist) > max_amp_hist:
+                    del amp_reward_hist[:-max_amp_hist]
+                if len(amp_weight_hist) > max_amp_hist:
+                    del amp_weight_hist[:-max_amp_hist]
+
+                amp_obs_current = _compute_amp_obs_batch(
+                    raw_obs_batch=raw_next_obs_for_rollout,
+                    infos_payload=rollout_infos_payload,
+                    num_envs=args.num_envs,
+                    observation_mode=args.observation_mode,
+                    done_mask=done_mask,
+                    use_reset_info_for_done=(args.num_envs > 1),
+                    joint_qpos_dim=amp_joint_qpos_dim,
+                    joint_qvel_dim=amp_joint_qvel_dim,
+                    include_root_height=bool(args.amp_include_root_height),
+                )
 
             if args.task == "hug":
                 for info_env in infos_list:
@@ -899,6 +1269,39 @@ def train(args: argparse.Namespace) -> None:
 
             obs_batch = next_obs_for_rollout
             global_step += args.num_envs
+
+            if (
+                args.amp_enable
+                and amp_disc_trainer is not None
+                and amp_motion_buffer is not None
+                and amp_policy_buffer is not None
+                and global_step >= args.amp_warmup_steps
+                and amp_policy_buffer.size >= args.amp_disc_batch_size
+            ):
+                real_obs_t, real_obs_t1 = amp_motion_buffer.sample_torch(
+                    args.amp_disc_batch_size,
+                    device=str(device),
+                )
+                fake_obs_t, fake_obs_t1 = amp_policy_buffer.sample_torch(
+                    args.amp_disc_batch_size,
+                    device=str(device),
+                )
+                amp_disc_metrics = amp_disc_trainer.train_step(
+                    real_obs_t,
+                    real_obs_t1,
+                    fake_obs_t,
+                    fake_obs_t1,
+                )
+                amp_disc_loss_hist.append(float(amp_disc_metrics["disc_loss"]))
+                amp_d_real_hist.append(float(amp_disc_metrics["d_real"]))
+                amp_d_fake_hist.append(float(amp_disc_metrics["d_fake"]))
+                max_disc_hist = 2_000
+                if len(amp_disc_loss_hist) > max_disc_hist:
+                    del amp_disc_loss_hist[:-max_disc_hist]
+                if len(amp_d_real_hist) > max_disc_hist:
+                    del amp_d_real_hist[:-max_disc_hist]
+                if len(amp_d_fake_hist) > max_disc_hist:
+                    del amp_d_fake_hist[:-max_disc_hist]
 
             if (
                 global_step >= args.update_after
@@ -976,7 +1379,11 @@ def train(args: argparse.Namespace) -> None:
 
             # Curriculum promotion by success window.
             stage_up_msg = None
-            if args.auto_curriculum and current_stage < max_stage:
+            if (
+                args.auto_curriculum
+                and current_stage < max_stage
+                and (not args.amp_enable or global_step >= args.amp_approach_steps)
+            ):
                 success_window = float(
                     np.mean(completed_successes[-args.curriculum_window_episodes :])
                 ) if completed_successes else 0.0
@@ -1005,6 +1412,18 @@ def train(args: argparse.Namespace) -> None:
                         num_envs=args.num_envs,
                         adapter=obs_adapter,
                     )
+                    if args.amp_enable:
+                        amp_obs_current = _compute_amp_obs_batch(
+                            raw_obs_batch=raw_obs_batch,
+                            infos_payload=reset_infos,
+                            num_envs=args.num_envs,
+                            observation_mode=args.observation_mode,
+                            done_mask=None,
+                            use_reset_info_for_done=False,
+                            joint_qpos_dim=amp_joint_qpos_dim,
+                            joint_qvel_dim=amp_joint_qvel_dim,
+                            include_root_height=bool(args.amp_include_root_height),
+                        )
                     ep_returns[:] = 0.0
                     ep_lengths[:] = 0
 
@@ -1022,13 +1441,26 @@ def train(args: argparse.Namespace) -> None:
                 c1 = float(np.mean(critic_loss_hist["h1"][-100:])) if critic_loss_hist["h1"] else 0.0
                 a0 = float(np.mean(actor_loss_hist["h0"][-100:])) if actor_loss_hist["h0"] else 0.0
                 a1 = float(np.mean(actor_loss_hist["h1"][-100:])) if actor_loss_hist["h1"] else 0.0
+                amp_reward_mean = float(np.mean(amp_reward_hist[-2000:])) if amp_reward_hist else 0.0
+                amp_weight_now = (
+                    0.5 if global_step < args.amp_approach_steps else _amp_weight_for_stage(args, current_stage)
+                )
+                amp_disc_loss = float(np.mean(amp_disc_loss_hist[-100:])) if amp_disc_loss_hist else 0.0
+                amp_d_real = float(np.mean(amp_d_real_hist[-100:])) if amp_d_real_hist else 0.0
+                amp_d_fake = float(np.mean(amp_d_fake_hist[-100:])) if amp_d_fake_hist else 0.0
 
-                print(
+                msg = (
                     f"step={global_step}/{args.total_steps} sps={sps} stage={current_stage} "
                     f"ret20={mean_return:.2f} len20={mean_len:.1f} succ20={mean_success_20:.2f} "
                     f"succW={success_window:.2f} noise={current_noise:.3f} "
                     f"h0_closs={c0:.4f} h1_closs={c1:.4f} h0_aloss={a0:.4f} h1_aloss={a1:.4f}"
                 )
+                if args.amp_enable:
+                    msg += (
+                        f" amp_w={amp_weight_now:.2f} amp_r={amp_reward_mean:.3f} "
+                        f"d_loss={amp_disc_loss:.4f} d_real={amp_d_real:.3f} d_fake={amp_d_fake:.3f}"
+                    )
+                print(msg)
                 if stage_up_msg is not None:
                     print(stage_up_msg)
                 last_print_step = global_step
@@ -1039,6 +1471,15 @@ def train(args: argparse.Namespace) -> None:
                     "grad_updates": grad_updates,
                     "actor_updates": actor_updates,
                 }
+                if args.amp_enable:
+                    algo_metrics["amp_weight"] = float(amp_weight_now)
+                    algo_metrics["amp_reward_mean"] = float(amp_reward_mean)
+                    algo_metrics["amp_disc_loss"] = float(amp_disc_loss)
+                    algo_metrics["amp_d_real"] = float(amp_d_real)
+                    algo_metrics["amp_d_fake"] = float(amp_d_fake)
+                    algo_metrics["amp_policy_buffer_size"] = (
+                        int(amp_policy_buffer.size) if amp_policy_buffer is not None else 0
+                    )
                 for agent in AGENTS:
                     if critic_loss_hist[agent]:
                         algo_metrics[f"{agent}/critic_loss"] = float(np.mean(critic_loss_hist[agent][-100:]))
@@ -1093,6 +1534,14 @@ def train(args: argparse.Namespace) -> None:
                     "actor_optim": {agent: actor_optim[agent].state_dict() for agent in AGENTS},
                     "critic_optim": {agent: critic_optim[agent].state_dict() for agent in AGENTS},
                 }
+                if args.amp_enable and amp_discriminator is not None:
+                    payload["amp_discriminator"] = amp_discriminator.state_dict()
+                    payload["amp_obs_dim"] = int(amp_obs_dim)
+                    payload["amp_joint_qpos_dim"] = int(amp_joint_qpos_dim)
+                    payload["amp_joint_qvel_dim"] = int(amp_joint_qvel_dim)
+                    payload["amp_disc_optimizer"] = (
+                        amp_disc_trainer.optimizer.state_dict() if amp_disc_trainer is not None else None
+                    )
                 torch.save(payload, ckpt_path)
                 last_save_step = global_step
 

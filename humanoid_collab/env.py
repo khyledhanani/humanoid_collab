@@ -247,6 +247,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 "fixed_standing": self.fixed_standing,
                 "control_mode": self.control_mode,
                 "observation_mode": self.observation_mode,
+                "root_height": float(self._get_root_height(agent)),
                 "weights": self.task_config.get_weights_dict(),
                 **(
                     {"proprio_obs": proprio_obs[agent]}
@@ -360,6 +361,7 @@ class HumanoidCollabEnv(ParallelEnv):
                 "fixed_standing": self.fixed_standing,
                 "control_mode": self.control_mode,
                 "observation_mode": self.observation_mode,
+                "root_height": float(self._get_root_height(agent)),
                 **reward_info,
                 **success_info,
                 **{k: v for k, v in contact_info.items()},
@@ -594,6 +596,10 @@ class HumanoidCollabEnv(ParallelEnv):
         if len(control_idx["h0"]) != len(control_idx["h1"]):
             raise ValueError("Control actuator dim mismatch between h0 and h1.")
         return control_idx
+
+    def _get_root_height(self, agent: str) -> float:
+        qpos_idx = self.id_cache.joint_qpos_idx[agent]
+        return float(self.data.qpos[qpos_idx[2]])
 
     @staticmethod
     def _is_arm_actuator_name(act_name: str) -> bool:
