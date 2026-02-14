@@ -610,8 +610,32 @@ def train(args: argparse.Namespace) -> None:
         metrics["train/lr"] = current_lr
         metrics["train/global_step"] = global_step
 
-        # Log metrics
-        logger.log(metrics, step=global_step)
+        # Log metrics (ExperimentLogger expects structured namespaces).
+        common = {
+            "sps": sps,
+            "global_step": global_step,
+        }
+        if "episode/return_mean" in metrics:
+            common["ep_return_mean_100"] = metrics["episode/return_mean"]
+        if "episode/length_mean" in metrics:
+            common["ep_len_mean_100"] = metrics["episode/length_mean"]
+
+        algo = {
+            "lr": current_lr,
+            "amp_reward_mean": metrics["amp/reward_mean"],
+            "amp_reward_std": metrics["amp/reward_std"],
+            "disc_loss": metrics["disc/loss"],
+            "disc_gp_loss": metrics["disc/gp_loss"],
+            "disc_d_real": metrics["disc/d_real"],
+            "disc_d_fake": metrics["disc/d_fake"],
+        }
+        for agent in AGENTS:
+            for key in ("pg_loss", "vf_loss", "entropy", "approx_kl", "clip_frac"):
+                k = f"{agent}/{key}"
+                if k in metrics:
+                    algo[k] = metrics[k]
+
+        logger.log(step=global_step, common=common, algo=algo)
 
         # Print progress
         if update % args.print_every_updates == 0:

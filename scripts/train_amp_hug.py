@@ -588,7 +588,36 @@ def train(args: argparse.Namespace) -> None:
         metrics["train/sps"] = sps
         metrics["train/global_step"] = global_step
 
-        logger.log(metrics, step=global_step)
+        # Log metrics (ExperimentLogger expects structured namespaces).
+        common = {
+            "sps": sps,
+            "global_step": global_step,
+            "curriculum_stage": current_stage,
+        }
+        if "episode/return_mean" in metrics:
+            common["ep_return_mean_100"] = metrics["episode/return_mean"]
+        if "episode/length_mean" in metrics:
+            common["ep_len_mean_100"] = metrics["episode/length_mean"]
+        if "episode/success_rate" in metrics:
+            common["ep_success_window"] = metrics["episode/success_rate"]
+
+        algo = {
+            "lr": current_lr,
+            "amp_weight": amp_weight,
+            "amp_reward_mean": metrics["amp/reward_mean"],
+            "amp_reward_std": metrics["amp/reward_std"],
+            "disc_loss": metrics["disc/loss"],
+            "disc_d_real": metrics["disc/d_real"],
+            "disc_d_fake": metrics["disc/d_fake"],
+            "phase_approach": metrics["phase/approach"],
+        }
+        for agent in AGENTS:
+            for key in ("pg_loss", "vf_loss", "approx_kl"):
+                k = f"{agent}/{key}"
+                if k in metrics:
+                    algo[k] = metrics[k]
+
+        logger.log(step=global_step, common=common, algo=algo, task={"stage": current_stage})
 
         if update % args.print_every_updates == 0:
             ret_str = f"{metrics.get('episode/return_mean', 0.0):.2f}" if completed_returns else "N/A"
