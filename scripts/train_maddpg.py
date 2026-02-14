@@ -187,12 +187,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-approach-distance-weight", type=float, default=0.75)
     parser.add_argument("--amp-approach-distance-scale", type=float, default=1.5)
     parser.add_argument("--amp-approach-progress-clip", type=float, default=0.05)
+    parser.add_argument("--amp-approach-upright-weight", type=float, default=0.20)
+    parser.add_argument("--amp-approach-fall-penalty", type=float, default=2.0)
     parser.add_argument("--amp-weight-override", type=float, default=None)
     parser.add_argument("--amp-weight-stage0", type=float, default=0.40)
     parser.add_argument("--amp-weight-stage1", type=float, default=0.35)
     parser.add_argument("--amp-weight-stage2", type=float, default=0.30)
     parser.add_argument("--amp-weight-stage3", type=float, default=0.25)
     parser.add_argument("--amp-include-root-height", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp-normalize-reward", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp-reward-anchor-momentum", type=float, default=0.05)
 
     return parser.parse_args()
 
@@ -481,12 +485,17 @@ def _compute_dense_approach_reward(
     heading_weight: float,
     distance_weight: float,
     distance_scale: float,
+    upright_weight: float,
+    fall_penalty: float,
 ) -> np.ndarray:
     reward = np.zeros((len(infos_list),), dtype=np.float32)
     for env_idx, info_env in enumerate(infos_list):
         h0_info = info_env.get("h0", {})
         chest_dist = float(h0_info.get("chest_distance", np.nan))
         facing = float(h0_info.get("facing_alignment", 0.0))
+        upright_ok = 1.0 if bool(h0_info.get("hug_upright_ok", False)) else 0.0
+        termination_reason = str(h0_info.get("termination_reason", "running"))
+        fell = termination_reason.startswith("fall_")
 
         if np.isfinite(prev_chest_dist[env_idx]) and np.isfinite(chest_dist):
             progress = float(prev_chest_dist[env_idx] - chest_dist)
@@ -501,10 +510,40 @@ def _compute_dense_approach_reward(
             progress_weight * progress
             + heading_weight * heading
             + distance_weight * dist_shape
+            + upright_weight * upright_ok
         )
+        if fell:
+            reward[env_idx] -= float(fall_penalty)
         prev_chest_dist[env_idx] = chest_dist
 
     return reward
+
+
+def _update_running_anchor(
+    current: Optional[float],
+    new_value: float,
+    momentum: float,
+) -> float:
+    if current is None:
+        return float(new_value)
+    m = float(np.clip(momentum, 1e-4, 1.0))
+    return float((1.0 - m) * current + m * new_value)
+
+
+def _normalized_amp_reward(
+    d_score: np.ndarray,
+    d_real_anchor: Optional[float],
+    d_fake_anchor: Optional[float],
+    reward_scale: float,
+    clip_reward: bool,
+) -> np.ndarray:
+    if d_real_anchor is None or d_fake_anchor is None:
+        return np.zeros_like(d_score, dtype=np.float32)
+    denom = float(max(1e-6, abs(d_real_anchor - d_fake_anchor)))
+    reward = (d_score - d_fake_anchor) / denom
+    if clip_reward:
+        reward = np.clip(reward, 0.0, 1.0)
+    return (float(reward_scale) * reward).astype(np.float32)
 
 
 def _amp_weight_for_stage(args: argparse.Namespace, stage: int) -> float:
@@ -861,6 +900,8 @@ def train(args: argparse.Namespace) -> None:
     amp_joint_qpos_dim = 0
     amp_joint_qvel_dim = 0
     amp_obs_dim = 0
+    amp_d_real_anchor: Optional[float] = None
+    amp_d_fake_anchor: Optional[float] = None
 
     if args.amp_enable:
         motion_dataset = load_motion_dataset(
@@ -929,6 +970,15 @@ def train(args: argparse.Namespace) -> None:
                 if disc_opt is not None:
                     amp_disc_trainer.optimizer.load_state_dict(disc_opt)
         amp_discriminator.eval()
+        if args.amp_normalize_reward and amp_motion_buffer is not None:
+            bootstrap_batch = min(int(args.amp_disc_batch_size), max(128, min(4096, amp_motion_buffer.num_transitions)))
+            real_obs_t, real_obs_t1 = amp_motion_buffer.sample_torch(
+                bootstrap_batch,
+                device=str(device),
+            )
+            with torch.no_grad():
+                real_scores = amp_discriminator(real_obs_t, real_obs_t1)
+            amp_d_real_anchor = float(real_scores.mean().item())
 
     actors: Dict[str, Actor] = {}
     critics: Dict[str, Critic] = {}
@@ -1199,17 +1249,38 @@ def train(args: argparse.Namespace) -> None:
                 )
 
                 amp_style_rewards: Dict[str, np.ndarray] = {}
+                amp_d_score_means: Dict[str, float] = {}
                 for agent in AGENTS:
                     obs_t_t = torch.as_tensor(amp_obs_t[agent], dtype=torch.float32, device=device)
                     obs_t1_t = torch.as_tensor(amp_obs_t1_for_buffer[agent], dtype=torch.float32, device=device)
                     with torch.no_grad():
-                        r_style = amp_discriminator.compute_reward(
-                            obs_t_t,
-                            obs_t1_t,
-                            clip_reward=bool(args.amp_clip_reward),
+                        d_score_t = amp_discriminator(obs_t_t, obs_t1_t)
+                    d_score_np = d_score_t.detach().cpu().numpy().astype(np.float32)
+                    amp_d_score_means[agent] = float(np.mean(d_score_np))
+                    if args.amp_normalize_reward:
+                        amp_style_rewards[agent] = _normalized_amp_reward(
+                            d_score=d_score_np,
+                            d_real_anchor=amp_d_real_anchor,
+                            d_fake_anchor=amp_d_fake_anchor,
                             reward_scale=float(args.amp_reward_scale),
+                            clip_reward=bool(args.amp_clip_reward),
                         )
-                    amp_style_rewards[agent] = r_style.detach().cpu().numpy().astype(np.float32)
+                    else:
+                        with torch.no_grad():
+                            r_style = amp_discriminator.compute_reward(
+                                obs_t_t,
+                                obs_t1_t,
+                                clip_reward=bool(args.amp_clip_reward),
+                                reward_scale=float(args.amp_reward_scale),
+                            )
+                        amp_style_rewards[agent] = r_style.detach().cpu().numpy().astype(np.float32)
+                if args.amp_normalize_reward:
+                    policy_mean = float(np.mean([amp_d_score_means[a] for a in AGENTS]))
+                    amp_d_fake_anchor = _update_running_anchor(
+                        amp_d_fake_anchor,
+                        policy_mean,
+                        momentum=float(args.amp_reward_anchor_momentum),
+                    )
 
                 in_approach_phase = bool(global_step < args.amp_approach_steps)
                 amp_weight = 0.5 if in_approach_phase else _amp_weight_for_stage(args, current_stage)
@@ -1226,6 +1297,8 @@ def train(args: argparse.Namespace) -> None:
                         heading_weight=float(args.amp_approach_heading_weight),
                         distance_weight=float(args.amp_approach_distance_weight),
                         distance_scale=float(args.amp_approach_distance_scale),
+                        upright_weight=float(args.amp_approach_upright_weight),
+                        fall_penalty=float(args.amp_approach_fall_penalty),
                     )
                     approach_reward_hist.extend(approach_reward.tolist())
 
@@ -1343,6 +1416,17 @@ def train(args: argparse.Namespace) -> None:
                     fake_obs_t,
                     fake_obs_t1,
                 )
+                if args.amp_normalize_reward:
+                    amp_d_real_anchor = _update_running_anchor(
+                        amp_d_real_anchor,
+                        float(amp_disc_metrics["d_real"]),
+                        momentum=float(args.amp_reward_anchor_momentum),
+                    )
+                    amp_d_fake_anchor = _update_running_anchor(
+                        amp_d_fake_anchor,
+                        float(amp_disc_metrics["d_fake"]),
+                        momentum=float(args.amp_reward_anchor_momentum),
+                    )
                 amp_disc_loss_hist.append(float(amp_disc_metrics["disc_loss"]))
                 amp_d_real_hist.append(float(amp_disc_metrics["d_real"]))
                 amp_d_fake_hist.append(float(amp_disc_metrics["d_fake"]))
@@ -1535,6 +1619,13 @@ def train(args: argparse.Namespace) -> None:
                     algo_metrics["amp_disc_loss"] = float(amp_disc_loss)
                     algo_metrics["amp_d_real"] = float(amp_d_real)
                     algo_metrics["amp_d_fake"] = float(amp_d_fake)
+                    if args.amp_normalize_reward:
+                        algo_metrics["amp_d_real_anchor"] = (
+                            float(amp_d_real_anchor) if amp_d_real_anchor is not None else 0.0
+                        )
+                        algo_metrics["amp_d_fake_anchor"] = (
+                            float(amp_d_fake_anchor) if amp_d_fake_anchor is not None else 0.0
+                        )
                     algo_metrics["amp_policy_buffer_size"] = (
                         int(amp_policy_buffer.size) if amp_policy_buffer is not None else 0
                     )

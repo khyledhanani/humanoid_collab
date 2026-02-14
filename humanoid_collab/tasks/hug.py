@@ -14,6 +14,7 @@ from humanoid_collab.utils.kinematics import (
     compute_tilt_angle,
     get_root_linear_velocity,
 )
+from humanoid_collab.constants import DEFAULT_ROOT_Z
 
 
 # Curriculum weights per stage.
@@ -130,7 +131,7 @@ class HugTask(TaskConfig):
         # H0 position & orientation
         data.qpos[h0_qpos[0]] = -half_dist + rng.uniform(-0.1, 0.1)
         data.qpos[h0_qpos[1]] = rng.uniform(-0.1, 0.1)
-        data.qpos[h0_qpos[2]] = 1.4
+        data.qpos[h0_qpos[2]] = DEFAULT_ROOT_Z
         yaw0 = rng.uniform(-0.2, 0.2)
         data.qpos[h0_qpos[3]] = np.cos(yaw0 / 2)
         data.qpos[h0_qpos[4]] = 0.0
@@ -140,7 +141,7 @@ class HugTask(TaskConfig):
         # H1 position & orientation
         data.qpos[h1_qpos[0]] = half_dist + rng.uniform(-0.1, 0.1)
         data.qpos[h1_qpos[1]] = rng.uniform(-0.1, 0.1)
-        data.qpos[h1_qpos[2]] = 1.4
+        data.qpos[h1_qpos[2]] = DEFAULT_ROOT_Z
         yaw1 = np.pi + rng.uniform(-0.2, 0.2)
         data.qpos[h1_qpos[3]] = np.cos(yaw1 / 2)
         data.qpos[h1_qpos[4]] = 0.0

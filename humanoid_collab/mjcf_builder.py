@@ -2,6 +2,8 @@
 
 from typing import Dict, Optional
 
+from humanoid_collab.constants import DEFAULT_ROOT_Z
+
 
 _PHYSICS_PROFILES: Dict[str, Dict[str, str]] = {
     # Highest-fidelity baseline used by the original environment.
@@ -236,8 +238,8 @@ def build_mjcf(
 
     physics = _PHYSICS_PROFILES[physics_profile]
 
-    h0_pos = f"{-float(spawn_half_distance)} 0 1.4"
-    h1_pos = f"{float(spawn_half_distance)} 0 1.4"
+    h0_pos = f"{-float(spawn_half_distance)} 0 {DEFAULT_ROOT_Z}"
+    h1_pos = f"{float(spawn_half_distance)} 0 {DEFAULT_ROOT_Z}"
     h0_body = _humanoid_body("h0", h0_pos, "h0_mat")
     h1_quat = "0 0 0 1" if h1_faces_h0 else None
     h1_body = _humanoid_body("h1", h1_pos, "h1_mat", quat=h1_quat)
