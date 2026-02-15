@@ -92,11 +92,13 @@ _WALK_STAGES = {
 }
 
 _TARGET_DISTANCE_BY_STAGE = {
-    0: (0.7, 1.5),
-    1: (0.9, 2.0),
-    2: (1.1, 2.6),
-    3: (1.3, 3.2),
+    0: (2.0, 4.0),
+    1: (3.0, 5.0),
+    2: (5.0, 7.0),
+    3: (6.0, 9.0),
 }
+
+_STAGE0_FORWARD_CONE_HALF_ANGLE = np.deg2rad(65.0)
 
 _SUCCESS_THRESHOLDS = {
     0: dict(arrival_dist=0.50, success_dist=0.45, success_speed=0.80, success_heading=0.15),
@@ -184,7 +186,14 @@ class WalkToTargetTask(TaskConfig):
 
         d_min, d_max = _TARGET_DISTANCE_BY_STAGE.get(self._stage, _TARGET_DISTANCE_BY_STAGE[0])
         target_dist = rng.uniform(d_min, d_max)
-        target_bearing = rng.uniform(-np.pi, np.pi)
+        if self._stage == 0 or self._stage == 1:
+            # Stage 0: spawn targets ahead of h0 to encourage forward locomotion.
+            target_bearing = yaw0 + rng.uniform(
+                -_STAGE0_FORWARD_CONE_HALF_ANGLE,
+                _STAGE0_FORWARD_CONE_HALF_ANGLE,
+            )
+        else:
+            target_bearing = rng.uniform(-np.pi, np.pi)
         self._target_xy = np.asarray(
             [
                 h0_xy[0] + target_dist * np.cos(target_bearing),
