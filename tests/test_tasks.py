@@ -12,6 +12,7 @@ class TestTaskRegistry:
         assert "hug" in tasks
         assert "handshake" in tasks
         assert "box_lift" in tasks
+        assert "walk_to_target" in tasks
 
     def test_get_task_returns_config(self):
         for name in available_tasks():
@@ -127,8 +128,40 @@ class TestBoxLiftTask:
         env.close()
 
 
+class TestWalkToTargetTask:
+    def test_walk_to_target_obs_dim(self):
+        config = get_task("walk_to_target")
+        assert config.task_obs_dim == 10
+
+    def test_walk_to_target_curriculum_stages(self):
+        config = get_task("walk_to_target")
+        assert config.num_curriculum_stages == 4
+        for stage in range(4):
+            config.set_stage(stage)
+            weights = config.get_weights_dict()
+            assert isinstance(weights, dict)
+
+    def test_walk_to_target_has_marker_in_scene(self):
+        env = HumanoidCollabEnv(task="walk_to_target")
+        env.reset(seed=42)
+        target_pos = env.id_cache.get_site_xpos(env.data, "walk_target_site")
+        assert target_pos is not None
+        assert len(target_pos) == 3
+        env.close()
+
+    def test_walk_to_target_reward_computation(self):
+        env = HumanoidCollabEnv(task="walk_to_target")
+        env.reset(seed=42)
+        actions = {agent: env.action_space(agent).sample() for agent in env.agents}
+        _, rewards, _, _, infos = env.step(actions)
+        for agent in ["h0", "h1"]:
+            assert isinstance(rewards[agent], float)
+            assert "walk_dist_xy" in infos[agent]
+        env.close()
+
+
 class TestAllTasksReward:
-    @pytest.mark.parametrize("task", ["hug", "handshake", "box_lift"])
+    @pytest.mark.parametrize("task", ["hug", "handshake", "box_lift", "walk_to_target"])
     def test_reward_no_nan(self, task):
         env = HumanoidCollabEnv(task=task)
         env.reset(seed=42)
@@ -141,7 +174,7 @@ class TestAllTasksReward:
                 assert not np.isnan(rewards[agent]), f"NaN reward in {task}"
         env.close()
 
-    @pytest.mark.parametrize("task", ["hug", "handshake", "box_lift"])
+    @pytest.mark.parametrize("task", ["hug", "handshake", "box_lift", "walk_to_target"])
     def test_cooperative_reward(self, task):
         """Both agents should receive the same reward (cooperative)."""
         env = HumanoidCollabEnv(task=task)

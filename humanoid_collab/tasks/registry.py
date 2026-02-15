@@ -42,5 +42,6 @@ def available_tasks():
 from humanoid_collab.tasks import hug  # noqa: E402, F401
 from humanoid_collab.tasks import handshake  # noqa: E402, F401
 from humanoid_collab.tasks import box_lift  # noqa: E402, F401
+from humanoid_collab.tasks import walk_to_target  # noqa: E402, F401
 
 TASK_REGISTRY = _TASK_CLASSES

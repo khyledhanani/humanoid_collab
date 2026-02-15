@@ -5,7 +5,7 @@ import numpy as np
 from humanoid_collab.env import HumanoidCollabEnv
 
 
-TASKS = ["hug", "handshake", "box_lift"]
+TASKS = ["hug", "handshake", "box_lift", "walk_to_target"]
 
 
 @pytest.fixture(params=TASKS)
@@ -74,7 +74,7 @@ class TestObsShape:
 class TestActionShape:
     def test_action_dim_matches_actuators(self, env):
         action_dim = env.action_space("h0").shape[0]
-        assert action_dim == 18, f"Expected 18 actuators, got {action_dim}"
+        assert action_dim == 22, f"Expected 22 actuators, got {action_dim}"
 
     def test_action_bounds(self, env):
         space = env.action_space("h0")

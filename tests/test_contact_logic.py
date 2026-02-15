@@ -5,7 +5,7 @@ import numpy as np
 from humanoid_collab.env import HumanoidCollabEnv
 
 
-TASKS = ["hug", "handshake", "box_lift"]
+TASKS = ["hug", "handshake", "box_lift", "walk_to_target"]
 
 
 @pytest.fixture(params=TASKS)

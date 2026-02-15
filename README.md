@@ -9,6 +9,7 @@ A generalized two-agent humanoid collaboration environment using MuJoCo and Pett
 | **hug** | Two agents approach, embrace, and hold a stable hug | Mutual arm-torso contact + facing + proximity + stability for K steps |
 | **handshake** | Two agents approach, extend hands, and shake | Hand-to-hand contact + facing + arm's-length distance + stability for K steps |
 | **box_lift** | Two agents cooperatively grip and lift a box | Box at target height + both gripping + stable + upright for K steps |
+| **walk_to_target** | Single-agent locomotion pretraining task (h0 active) | Reach target + stop + face target + stay upright for K steps |
 
 ## Installation
 
@@ -38,6 +39,7 @@ pip install -e ".[train]"
 python scripts/rollout_random.py --task hug
 python scripts/rollout_random.py --task handshake
 python scripts/rollout_random.py --task box_lift --stage 2
+python scripts/rollout_random.py --task walk_to_target --stage 1
 ```
 
 ### Render demo
@@ -76,6 +78,8 @@ python scripts/train_ippo.py --task handshake --backend cpu --fixed-standing --c
 python scripts/render_ippo.py --checkpoint checkpoints/ippo_handshake_fixed_arms/ippo_update_000100.pt --episodes 3 --deterministic
 python scripts/train_maddpg.py --task handshake --backend cpu --fixed-standing --control-mode arms_only --stage 2 --num-envs 8 --vec-env-backend shared_memory --total-steps 800000 --device cuda
 python scripts/render_maddpg.py --checkpoint checkpoints/maddpg_handshake_fixed_arms/maddpg_step_0800000.pt --episodes 3
+python scripts/train_ddpg_amp_walk_to_target.py --amp-motion-data-dir data/amp_processed --amp-disc-checkpoint checkpoints/amp_pretrain/discriminator_latest.pt --total-steps 1000000 --device cuda
+python scripts/render_ddpg_amp_walk_to_target.py --checkpoint checkpoints/ddpg_amp_walk_to_target/latest.pt --episodes 3
 ```
 
 Available physics profiles: `default`, `balanced`, `train_fast`.
@@ -127,7 +131,7 @@ The environment implements PettingZoo's `ParallelEnv` with two agents (`h0`, `h1
 
 ```python
 HumanoidCollabEnv(
-    task="hug",          # Task name: "hug", "handshake", "box_lift"
+    task="hug",          # Task name: "hug", "handshake", "box_lift", "walk_to_target"
     render_mode=None,     # "human" or "rgb_array"
     horizon=1000,         # Max steps per episode
     frame_skip=5,         # Physics steps per action

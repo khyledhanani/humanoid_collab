@@ -63,6 +63,7 @@ def _humanoid_body(
       <camera name="{prefix}_track" mode="trackcom" pos="0 -4 0" xyaxes="1 0 0 0 0 1"/>
       <camera name="{prefix}_ego" mode="fixed" pos="0 0 0.22" xyaxes="0 -1 0 0 0 1" fovy="80"/>
       <freejoint name="{prefix}_root"/>
+      <inertial pos="0 0 -0.02" mass="14.0" diaginertia="0.30 0.23 0.27"/>
 
       <geom name="{prefix}_torso_geom" fromto="0 -0.07 0 0 0.07 0" size="0.07" type="capsule" material="{material}"/>
       <geom name="{prefix}_chest_geom" fromto="0 -0.06 0.15 0 0.06 0.15" size="0.06" type="capsule" material="{material}"/>
@@ -73,6 +74,7 @@ def _humanoid_body(
       <site name="{prefix}_back" pos="-0.08 0 0.05" size="0.02" rgba="1 0 0 0.5"/>
 
       <body name="{prefix}_head" pos="0 0 0.25">
+        <inertial pos="0 0 0.02" mass="4.5" diaginertia="0.018 0.017 0.015"/>
         <joint name="{prefix}_head_yaw" type="hinge" axis="0 0 1" range="-50 50" armature="0.02" damping="0.1" stiffness="5"/>
         <joint name="{prefix}_head_pitch" type="hinge" axis="0 1 0" range="-30 30" armature="0.02" damping="0.1" stiffness="5"/>
         <geom name="{prefix}_head_geom" type="sphere" size="0.09" material="{material}"/>
@@ -112,40 +114,71 @@ def _humanoid_body(
       </body>
 
       <body name="{prefix}_lower_body" pos="0 0 -0.2">
+        <inertial pos="0 0 -0.02" mass="9.0" diaginertia="0.16 0.12 0.14"/>
         <joint name="{prefix}_abdomen_z" type="hinge" axis="0 0 1" range="-45 45" armature="0.02"/>
         <joint name="{prefix}_abdomen_y" type="hinge" axis="0 1 0" range="-75 30" armature="0.02"/>
         <geom name="{prefix}_pelvis_geom" fromto="-0.02 -0.07 0 -0.02 0.07 0" size="0.09" type="capsule" material="{material}"/>
 
         <body name="{prefix}_left_thigh" pos="0 0.1 -0.04">
+          <inertial pos="0 0 -0.19" mass="4.8" diaginertia="0.052 0.050 0.010"/>
           <joint name="{prefix}_left_hip_x" type="hinge" axis="1 0 0" range="-25 5" armature="0.01"/>
           <joint name="{prefix}_left_hip_z" type="hinge" axis="0 0 1" range="-60 35" armature="0.01"/>
           <joint name="{prefix}_left_hip_y" type="hinge" axis="0 1 0" range="-110 20" armature="0.01"/>
           <geom name="{prefix}_left_thigh_geom" fromto="0 0 0 0 0.01 -0.34" size="0.06" type="capsule" material="{material}"/>
 
           <body name="{prefix}_left_shin" pos="0 0.01 -0.403">
+            <inertial pos="0 0 -0.16" mass="2.6" diaginertia="0.030 0.028 0.006"/>
             <joint name="{prefix}_left_knee" type="hinge" axis="0 1 0" range="-160 -2" armature="0.006"/>
             <geom name="{prefix}_left_shin_geom" fromto="0 0 0 0 0 -0.3" size="0.049" type="capsule" material="{material}"/>
 
-            <body name="{prefix}_left_foot" pos="0 0 -0.35">
-              <joint name="{prefix}_left_ankle" type="hinge" axis="0 1 0" range="-50 50" armature="0.008"/>
-              <geom name="{prefix}_left_foot_geom" fromto="-0.07 -0.02 0 0.14 -0.04 0" size="0.027" type="capsule" material="{material}"/>
+            <body name="{prefix}_left_ankle_roll_link" pos="0 0 -0.35">
+              <inertial pos="0 0 0" mass="0.05" diaginertia="0.00003 0.00003 0.00003"/>
+              <joint name="{prefix}_left_ankle_roll" type="hinge" axis="1 0 0" range="-25 25" armature="0.008"/>
+
+              <body name="{prefix}_left_foot">
+                <inertial pos="0.03 0 -0.02" mass="1.0" diaginertia="0.0040 0.0014 0.0044"/>
+                <joint name="{prefix}_left_ankle" type="hinge" axis="0 1 0" range="-50 50" armature="0.008"/>
+                <geom name="{prefix}_left_heel_geom" type="box" pos="-0.035 0 -0.02" size="0.045 0.032 0.018" friction="1.1 0.08 0.02" material="{material}"/>
+                <geom name="{prefix}_left_forefoot_geom" type="box" pos="0.065 0 -0.024" size="0.065 0.036 0.014" friction="1.2 0.08 0.02" material="{material}"/>
+
+                <body name="{prefix}_left_toe" pos="0.14 0 -0.018">
+                  <inertial pos="0.03 0 0" mass="0.20" diaginertia="0.00025 0.00009 0.00026"/>
+                  <joint name="{prefix}_left_toe" type="hinge" axis="0 1 0" range="-35 55" armature="0.003"/>
+                  <geom name="{prefix}_left_toe_geom" type="box" pos="0.03 0 0" size="0.036 0.028 0.010" friction="1.25 0.08 0.02" material="{material}"/>
+                </body>
+              </body>
             </body>
           </body>
         </body>
 
         <body name="{prefix}_right_thigh" pos="0 -0.1 -0.04">
+          <inertial pos="0 0 -0.19" mass="4.8" diaginertia="0.052 0.050 0.010"/>
           <joint name="{prefix}_right_hip_x" type="hinge" axis="-1 0 0" range="-25 5" armature="0.01"/>
           <joint name="{prefix}_right_hip_z" type="hinge" axis="0 0 -1" range="-60 35" armature="0.01"/>
           <joint name="{prefix}_right_hip_y" type="hinge" axis="0 1 0" range="-110 20" armature="0.01"/>
           <geom name="{prefix}_right_thigh_geom" fromto="0 0 0 0 -0.01 -0.34" size="0.06" type="capsule" material="{material}"/>
 
           <body name="{prefix}_right_shin" pos="0 -0.01 -0.403">
+            <inertial pos="0 0 -0.16" mass="2.6" diaginertia="0.030 0.028 0.006"/>
             <joint name="{prefix}_right_knee" type="hinge" axis="0 1 0" range="-160 -2" armature="0.006"/>
             <geom name="{prefix}_right_shin_geom" fromto="0 0 0 0 0 -0.3" size="0.049" type="capsule" material="{material}"/>
 
-            <body name="{prefix}_right_foot" pos="0 0 -0.35">
-              <joint name="{prefix}_right_ankle" type="hinge" axis="0 1 0" range="-50 50" armature="0.008"/>
-              <geom name="{prefix}_right_foot_geom" fromto="-0.07 0.02 0 0.14 0.04 0" size="0.027" type="capsule" material="{material}"/>
+            <body name="{prefix}_right_ankle_roll_link" pos="0 0 -0.35">
+              <inertial pos="0 0 0" mass="0.05" diaginertia="0.00003 0.00003 0.00003"/>
+              <joint name="{prefix}_right_ankle_roll" type="hinge" axis="-1 0 0" range="-25 25" armature="0.008"/>
+
+              <body name="{prefix}_right_foot">
+                <inertial pos="0.03 0 -0.02" mass="1.0" diaginertia="0.0040 0.0014 0.0044"/>
+                <joint name="{prefix}_right_ankle" type="hinge" axis="0 1 0" range="-50 50" armature="0.008"/>
+                <geom name="{prefix}_right_heel_geom" type="box" pos="-0.035 0 -0.02" size="0.045 0.032 0.018" friction="1.1 0.08 0.02" material="{material}"/>
+                <geom name="{prefix}_right_forefoot_geom" type="box" pos="0.065 0 -0.024" size="0.065 0.036 0.014" friction="1.2 0.08 0.02" material="{material}"/>
+
+                <body name="{prefix}_right_toe" pos="0.14 0 -0.018">
+                  <inertial pos="0.03 0 0" mass="0.20" diaginertia="0.00025 0.00009 0.00026"/>
+                  <joint name="{prefix}_right_toe" type="hinge" axis="0 1 0" range="-35 55" armature="0.003"/>
+                  <geom name="{prefix}_right_toe_geom" type="box" pos="0.03 0 0" size="0.036 0.028 0.010" friction="1.25 0.08 0.02" material="{material}"/>
+                </body>
+              </body>
             </body>
           </body>
         </body>
@@ -169,12 +202,16 @@ def _humanoid_actuators(prefix: str) -> str:
     <motor name="{prefix}_left_hip_z" joint="{prefix}_left_hip_z" gear="100" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_hip_y" joint="{prefix}_left_hip_y" gear="100" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_knee" joint="{prefix}_left_knee" gear="100" ctrlrange="-1 1"/>
+    <motor name="{prefix}_left_ankle_roll" joint="{prefix}_left_ankle_roll" gear="80" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_ankle" joint="{prefix}_left_ankle" gear="100" ctrlrange="-1 1"/>
+    <motor name="{prefix}_left_toe" joint="{prefix}_left_toe" gear="60" ctrlrange="-1 1"/>
     <motor name="{prefix}_right_hip_x" joint="{prefix}_right_hip_x" gear="100" ctrlrange="-1 1"/>
     <motor name="{prefix}_right_hip_z" joint="{prefix}_right_hip_z" gear="100" ctrlrange="-1 1"/>
     <motor name="{prefix}_right_hip_y" joint="{prefix}_right_hip_y" gear="100" ctrlrange="-1 1"/>
     <motor name="{prefix}_right_knee" joint="{prefix}_right_knee" gear="100" ctrlrange="-1 1"/>
+    <motor name="{prefix}_right_ankle_roll" joint="{prefix}_right_ankle_roll" gear="80" ctrlrange="-1 1"/>
     <motor name="{prefix}_right_ankle" joint="{prefix}_right_ankle" gear="100" ctrlrange="-1 1"/>
+    <motor name="{prefix}_right_toe" joint="{prefix}_right_toe" gear="60" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_shoulder1" joint="{prefix}_left_shoulder1" gear="25" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_shoulder2" joint="{prefix}_left_shoulder2" gear="25" ctrlrange="-1 1"/>
     <motor name="{prefix}_left_elbow" joint="{prefix}_left_elbow" gear="25" ctrlrange="-1 1"/>
@@ -248,7 +285,7 @@ def build_mjcf(
     equality_block = _fixed_standing_equality(fixed_standing_mode) if fixed_standing else ""
 
     xml = f"""<mujoco model="humanoid_collab">
-  <compiler angle="degree" inertiafromgeom="true"/>
+  <compiler angle="degree" inertiafromgeom="auto"/>
   <option timestep="{physics['timestep']}" iterations="{physics['iterations']}" tolerance="{physics['tolerance']}" solver="{physics['solver']}" jacobian="{physics['jacobian']}" cone="{physics['cone']}"/>
 
   <size nstack="3000000" nuser_body="1"/>

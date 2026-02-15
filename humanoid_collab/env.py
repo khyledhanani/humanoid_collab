@@ -32,7 +32,7 @@ class HumanoidCollabEnv(ParallelEnv):
         stage: Curriculum stage
         physics_profile: MuJoCo physics profile ("default", "balanced", "train_fast")
         fixed_standing: If True, use task-specific standing anchors (no locomotion).
-        control_mode: "all" (18 actuators) or "arms_only" (6 arm actuators).
+        control_mode: "all" (22 actuators) or "arms_only" (6 arm actuators).
         observation_mode: "proprio" (vector), "rgb" (egocentric color image),
             or "gray" (egocentric grayscale image).
         obs_rgb_width: Visual observation width (used when observation_mode is rgb/gray).
