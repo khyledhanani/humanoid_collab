@@ -7,7 +7,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -22,12 +22,16 @@ except ImportError as exc:
     ) from exc
 
 from humanoid_collab import HumanoidCollabEnv
-from humanoid_collab.amp.amp_obs import AMPObsBuilder
+from humanoid_collab.amp.amp_obs import AMPObsBuilder, quat_to_mat
 from humanoid_collab.amp.discriminator import AMPDiscriminator, AMPDiscriminatorTrainer
 from humanoid_collab.amp.motion_buffer import MotionReplayBuffer, PolicyTransitionBuffer
 from humanoid_collab.amp.motion_data import load_motion_dataset
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.utils.exp_logging import ExperimentLogger
+from humanoid_collab.vector_env import (
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +51,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--observation-mode", type=str, default="proprio", choices=["proprio"])
 
     parser.add_argument("--total-steps", type=int, default=1_000_000)
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument(
+        "--vec-env-backend",
+        type=str,
+        default="shared_memory",
+        choices=["shared_memory", "subproc"],
+        help="Vector env backend used when --num-envs > 1.",
+    )
+    parser.add_argument("--vec-backend", dest="vec_env_backend", choices=["shared_memory", "subproc"], help=argparse.SUPPRESS)
+    parser.add_argument("--start-method", type=str, default=None)
     parser.add_argument("--buffer-size", type=int, default=500_000)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--start-steps", type=int, default=10_000)
@@ -287,8 +301,8 @@ def _noise_std(args: argparse.Namespace, step_count: int) -> float:
     )
 
 
-def _build_env(args: argparse.Namespace, stage: int, seed: Optional[int]):
-    env = HumanoidCollabEnv(
+def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
+    return dict(
         task=args.task,
         stage=int(stage),
         horizon=int(args.horizon),
@@ -299,13 +313,193 @@ def _build_env(args: argparse.Namespace, stage: int, seed: Optional[int]):
         control_mode=args.control_mode,
         observation_mode=args.observation_mode,
     )
-    obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
-    return env, obs, infos
+
+
+def _format_reset_obs(obs: Dict[str, np.ndarray], num_envs: int) -> Dict[str, np.ndarray]:
+    if num_envs == 1:
+        return {
+            agent: np.asarray(obs[agent], dtype=np.float32)[None, ...]
+            for agent in ("h0", "h1")
+        }
+    return {
+        agent: np.asarray(obs[agent], dtype=np.float32)
+        for agent in ("h0", "h1")
+    }
+
+
+def _normalize_infos_payload(infos_payload: Any, num_envs: int) -> List[Dict[str, Dict[str, Any]]]:
+    if num_envs == 1 and isinstance(infos_payload, dict):
+        return [infos_payload]
+    if not isinstance(infos_payload, list):
+        raise TypeError(f"Expected list infos payload for num_envs={num_envs}, got {type(infos_payload)}")
+    return infos_payload
+
+
+def _extract_done_and_reasons_single(
+    terminations: Dict[str, bool],
+    truncations: Dict[str, bool],
+    infos: Dict[str, Dict[str, Any]],
+) -> Tuple[np.ndarray, List[str]]:
+    done = bool(terminations["h0"] or truncations["h0"])
+    reason = str(infos.get("h0", {}).get("termination_reason", "running"))
+    if done and reason == "running":
+        reason = "termination" if bool(terminations["h0"]) else "truncation"
+    return np.asarray([done], dtype=np.bool_), [reason]
+
+
+def _extract_done_and_reasons_vec(
+    terminations: Dict[str, np.ndarray],
+    truncations: Dict[str, np.ndarray],
+    infos_list: List[Dict[str, Dict[str, Any]]],
+) -> Tuple[np.ndarray, List[str]]:
+    term_h0 = np.asarray(terminations["h0"], dtype=np.bool_)
+    trunc_h0 = np.asarray(truncations["h0"], dtype=np.bool_)
+    done_mask = np.logical_or(term_h0, trunc_h0)
+    reasons: List[str] = []
+    for env_idx, done in enumerate(done_mask):
+        info_env = infos_list[env_idx] if env_idx < len(infos_list) else {}
+        reason = str(info_env.get("h0", {}).get("termination_reason", "running"))
+        if bool(done) and reason == "running":
+            reason = "termination" if bool(term_h0[env_idx]) else "truncation"
+        reasons.append(reason)
+    return done_mask, reasons
+
+
+def _maybe_replace_final_obs_from_infos(
+    next_obs_batch: np.ndarray,
+    done_mask: np.ndarray,
+    infos: List[Dict[str, Dict[str, Any]]],
+) -> np.ndarray:
+    out = np.asarray(next_obs_batch, dtype=np.float32).copy()
+    for env_idx, done in enumerate(done_mask):
+        if not bool(done):
+            continue
+        info_env = infos[env_idx] if env_idx < len(infos) else {}
+        final_obs = info_env.get("h0", {}).get("final_observation")
+        if final_obs is not None:
+            out[env_idx] = np.asarray(final_obs, dtype=np.float32)
+    return out
+
+
+def _extract_root_height_from_infos(
+    infos_list: List[Dict[str, Dict[str, Any]]],
+    num_envs: int,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+) -> np.ndarray:
+    if done_mask is None:
+        done_mask = np.zeros((num_envs,), dtype=np.bool_)
+    values: List[float] = []
+    for env_idx in range(num_envs):
+        info_env = infos_list[env_idx]
+        info_src = info_env.get("h0", {})
+        if use_reset_info_for_done and bool(done_mask[env_idx]):
+            reset_info = info_src.get("reset_info")
+            if isinstance(reset_info, dict):
+                info_src = reset_info
+        if "root_height" not in info_src:
+            raise KeyError("Expected 'root_height' in infos payload for AMP training.")
+        values.append(float(info_src["root_height"]))
+    return np.asarray(values, dtype=np.float32)
+
+
+def _build_amp_obs_from_proprio(
+    proprio_batch: np.ndarray,
+    root_height_batch: np.ndarray,
+    joint_qpos_dim: int,
+    joint_qvel_dim: int,
+    include_root_height: bool,
+) -> np.ndarray:
+    proprio = np.asarray(proprio_batch, dtype=np.float32)
+    if proprio.ndim != 2:
+        raise ValueError(f"Expected 2D proprio batch, got {proprio.shape}")
+    base_dim = joint_qpos_dim + joint_qvel_dim + 4 + 3
+    if proprio.shape[1] < base_dim:
+        raise ValueError(
+            f"Proprio dim is {proprio.shape[1]}, expected at least {base_dim} "
+            f"(joint_qpos={joint_qpos_dim}, joint_qvel={joint_qvel_dim})."
+        )
+
+    n = proprio.shape[0]
+    offset = 0
+    joint_qpos = proprio[:, offset : offset + joint_qpos_dim]
+    offset += joint_qpos_dim
+    joint_qvel = proprio[:, offset : offset + joint_qvel_dim]
+    offset += joint_qvel_dim
+    root_quat = proprio[:, offset : offset + 4]
+    offset += 4
+    root_angvel = proprio[:, offset : offset + 3]
+
+    fwd = np.zeros((n, 3), dtype=np.float32)
+    up = np.zeros((n, 3), dtype=np.float32)
+    for idx in range(n):
+        xmat = quat_to_mat(root_quat[idx])
+        fwd[idx] = xmat[:, 0].astype(np.float32)
+        up[idx] = xmat[:, 2].astype(np.float32)
+
+    parts: List[np.ndarray] = [joint_qpos, joint_qvel]
+    if include_root_height:
+        parts.append(root_height_batch.reshape(-1, 1))
+    parts.extend([fwd, up, root_angvel])
+    return np.concatenate(parts, axis=-1).astype(np.float32)
+
+
+def _compute_amp_obs_batch(
+    *,
+    raw_obs_batch: np.ndarray,
+    infos_payload: Any,
+    num_envs: int,
+    done_mask: Optional[np.ndarray],
+    use_reset_info_for_done: bool,
+    joint_qpos_dim: int,
+    joint_qvel_dim: int,
+    include_root_height: bool,
+) -> np.ndarray:
+    infos_list = _normalize_infos_payload(infos_payload, num_envs)
+    root_height = _extract_root_height_from_infos(
+        infos_list=infos_list,
+        num_envs=num_envs,
+        done_mask=done_mask,
+        use_reset_info_for_done=use_reset_info_for_done,
+    )
+    return _build_amp_obs_from_proprio(
+        proprio_batch=np.asarray(raw_obs_batch, dtype=np.float32),
+        root_height_batch=root_height,
+        joint_qpos_dim=joint_qpos_dim,
+        joint_qvel_dim=joint_qvel_dim,
+        include_root_height=include_root_height,
+    )
+
+
+def _build_env(args: argparse.Namespace, stage: int, seed: Optional[int]):
+    env_kwargs = _make_env_kwargs(args, stage)
+    if args.num_envs == 1:
+        env = HumanoidCollabEnv(**env_kwargs)
+        obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
+    else:
+        if args.vec_env_backend == "shared_memory":
+            env = SharedMemHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
+        else:
+            env = SubprocHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
+        obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
+    return env, _format_reset_obs(obs, args.num_envs), infos
 
 
 def train(args: argparse.Namespace) -> None:
     if args.total_steps <= 0:
         raise ValueError("--total-steps must be > 0")
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be > 0")
     if args.buffer_size <= args.batch_size:
         raise ValueError("--buffer-size should be larger than --batch-size")
     if args.curriculum_window_episodes <= 0:
@@ -344,9 +538,10 @@ def train(args: argparse.Namespace) -> None:
     probe_env.close()
 
     current_stage = int(np.clip(int(args.stage), 0, max_stage))
-    env, obs_dict, _ = _build_env(args, stage=current_stage, seed=args.seed)
+    env, obs_dict, reset_infos = _build_env(args, stage=current_stage, seed=args.seed)
     obs = np.asarray(obs_dict["h0"], dtype=np.float32)
-    obs_dim = int(obs.shape[0])
+    obs_dim = int(obs.shape[-1])
+    num_envs = int(obs.shape[0])
     act_dim = int(env.action_space("h0").shape[0])
 
     actor = Actor(obs_dim=obs_dim, act_dim=act_dim, hidden_size=args.hidden_size).to(device)
@@ -365,7 +560,10 @@ def train(args: argparse.Namespace) -> None:
     amp_discriminator: Optional[AMPDiscriminator] = None
     amp_disc_trainer: Optional[AMPDiscriminatorTrainer] = None
     amp_obs_builder: Optional[AMPObsBuilder] = None
+    amp_joint_qpos_dim = 0
+    amp_joint_qvel_dim = 0
     amp_obs_dim = 0
+    amp_obs_current: Optional[np.ndarray] = None
     amp_d_real_anchor: Optional[float] = None
     amp_d_fake_anchor: Optional[float] = None
 
@@ -378,13 +576,33 @@ def train(args: argparse.Namespace) -> None:
             env.close()
             raise RuntimeError("No motion clips loaded for AMP.")
 
-        amp_obs_builder = AMPObsBuilder(
-            id_cache=env.id_cache,
-            include_root_height=bool(args.amp_include_root_height),
-            include_root_orientation=True,
-            include_joint_positions=True,
-            include_joint_velocities=True,
-        )
+        sample_clip = motion_dataset.clips[0]
+        nq_agent = int(sample_clip.qpos.shape[1])
+        nv_agent = int(sample_clip.qvel.shape[1])
+        amp_joint_qpos_dim = nq_agent - 7
+        amp_joint_qvel_dim = nv_agent - 6
+
+        if isinstance(env, HumanoidCollabEnv):
+            amp_obs_builder = AMPObsBuilder(
+                id_cache=env.id_cache,
+                include_root_height=bool(args.amp_include_root_height),
+                include_root_orientation=True,
+                include_joint_positions=True,
+                include_joint_velocities=True,
+            )
+        else:
+            tmp_env = HumanoidCollabEnv(**_make_env_kwargs(args, current_stage))
+            try:
+                amp_obs_builder = AMPObsBuilder(
+                    id_cache=tmp_env.id_cache,
+                    include_root_height=bool(args.amp_include_root_height),
+                    include_root_orientation=True,
+                    include_joint_positions=True,
+                    include_joint_velocities=True,
+                )
+            finally:
+                tmp_env.close()
+
         amp_motion_buffer = MotionReplayBuffer(motion_dataset, amp_obs_builder)
         amp_obs_dim = int(amp_motion_buffer.obs_dim)
         amp_policy_buffer = PolicyTransitionBuffer(
@@ -422,6 +640,16 @@ def train(args: argparse.Namespace) -> None:
                 real_scores = amp_discriminator(real_obs_t, real_obs_t1).detach().cpu().numpy()
             amp_d_real_anchor = float(np.mean(real_scores))
             amp_d_fake_anchor = float(np.mean(real_scores) - 1.0)
+        amp_obs_current = _compute_amp_obs_batch(
+            raw_obs_batch=obs,
+            infos_payload=reset_infos,
+            num_envs=num_envs,
+            done_mask=None,
+            use_reset_info_for_done=False,
+            joint_qpos_dim=amp_joint_qpos_dim,
+            joint_qvel_dim=amp_joint_qvel_dim,
+            include_root_height=bool(args.amp_include_root_height),
+        )
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -459,9 +687,9 @@ def train(args: argparse.Namespace) -> None:
     amp_d_real_hist: List[float] = []
     amp_d_fake_hist: List[float] = []
 
-    ep_return = 0.0
-    ep_task_return = 0.0
-    ep_len = 0
+    ep_return = np.zeros((num_envs,), dtype=np.float32)
+    ep_task_return = np.zeros((num_envs,), dtype=np.float32)
+    ep_len = np.zeros((num_envs,), dtype=np.int32)
     start_time = time.time()
 
     if args.resume_from is not None:
@@ -515,8 +743,20 @@ def train(args: argparse.Namespace) -> None:
         current_stage = int(np.clip(int(ckpt.get("stage", current_stage)), 0, max_stage))
 
         env.close()
-        env, obs_dict, _ = _build_env(args, stage=current_stage, seed=None)
+        env, obs_dict, reset_infos = _build_env(args, stage=current_stage, seed=None)
         obs = np.asarray(obs_dict["h0"], dtype=np.float32)
+        num_envs = int(obs.shape[0])
+        if args.amp_enable:
+            amp_obs_current = _compute_amp_obs_batch(
+                raw_obs_batch=obs,
+                infos_payload=reset_infos,
+                num_envs=num_envs,
+                done_mask=None,
+                use_reset_info_for_done=False,
+                joint_qpos_dim=amp_joint_qpos_dim,
+                joint_qvel_dim=amp_joint_qvel_dim,
+                include_root_height=bool(args.amp_include_root_height),
+            )
         print(
             f"resumed from {args.resume_from}: global_step={global_step} "
             f"stage={current_stage} grad_updates={grad_updates} actor_updates={actor_updates}"
@@ -526,41 +766,68 @@ def train(args: argparse.Namespace) -> None:
         while global_step < args.total_steps:
             current_noise = _noise_std(args, global_step)
             if global_step < args.start_steps:
-                action = np.random.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+                action = np.random.uniform(-1.0, 1.0, size=(num_envs, act_dim)).astype(np.float32)
             else:
-                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
                 with torch.no_grad():
-                    action = actor(obs_t).squeeze(0).cpu().numpy()
+                    action = actor(obs_t).cpu().numpy()
                 if current_noise > 0.0:
                     action = action + np.random.normal(0.0, current_noise, size=action.shape)
                 action = np.clip(action, -1.0, 1.0).astype(np.float32)
 
-            amp_obs_t: Optional[np.ndarray] = None
-            if args.amp_enable and amp_obs_builder is not None:
-                amp_obs_t = amp_obs_builder.compute_obs(env.data, "h0")
+            if num_envs == 1:
+                step_actions = {"h0": action[0], "h1": np.zeros_like(action[0], dtype=np.float32)}
+                next_obs_dict, rewards_dict, terminations, truncations, infos = env.step(step_actions)
+                done_mask, reasons = _extract_done_and_reasons_single(terminations, truncations, infos)
+                raw_next_obs_for_buffer = np.asarray(next_obs_dict["h0"], dtype=np.float32)[None, ...]
+                raw_next_obs_for_rollout = raw_next_obs_for_buffer
+                infos_list = [infos]
+                rollout_infos_payload: Any = infos_list
+                task_reward_batch = np.asarray([float(rewards_dict["h0"])], dtype=np.float32)
 
-            step_actions = {"h0": action, "h1": np.zeros_like(action, dtype=np.float32)}
-            next_obs_dict, rewards, terminations, truncations, infos = env.step(step_actions)
+                if bool(done_mask[0]):
+                    reset_obs, reset_infos = env.reset(seed=None, options={"stage": int(current_stage)})
+                    raw_next_obs_for_rollout = np.asarray(reset_obs["h0"], dtype=np.float32)[None, ...]
+                    rollout_infos_payload = reset_infos
+            else:
+                step_actions = {"h0": action, "h1": np.zeros_like(action, dtype=np.float32)}
+                next_obs_vec, rewards_vec, terminations, truncations, infos_list = env.step(step_actions)
+                done_mask, reasons = _extract_done_and_reasons_vec(terminations, truncations, infos_list)
+                raw_next_obs_for_rollout = np.asarray(next_obs_vec["h0"], dtype=np.float32)
+                raw_next_obs_for_buffer = _maybe_replace_final_obs_from_infos(
+                    next_obs_batch=raw_next_obs_for_rollout,
+                    done_mask=done_mask,
+                    infos=infos_list,
+                )
+                rollout_infos_payload = infos_list
+                task_reward_batch = np.asarray(rewards_vec["h0"], dtype=np.float32)
 
-            task_reward = float(rewards["h0"])
-            combined_reward = task_reward
-            amp_reward_scalar = 0.0
+            combined_reward_batch = task_reward_batch.copy()
             amp_weight = 0.0
 
             if args.amp_enable:
                 if (
-                    amp_obs_builder is None
+                    amp_obs_current is None
                     or amp_discriminator is None
                     or amp_policy_buffer is None
-                    or amp_obs_t is None
                 ):
                     raise RuntimeError("AMP is enabled but AMP components are not initialized.")
 
-                amp_obs_t1 = amp_obs_builder.compute_obs(env.data, "h0")
-                amp_policy_buffer.add(amp_obs_t, amp_obs_t1)
+                amp_obs_t = amp_obs_current
+                amp_obs_t1_for_buffer = _compute_amp_obs_batch(
+                    raw_obs_batch=raw_next_obs_for_buffer,
+                    infos_payload=infos_list,
+                    num_envs=num_envs,
+                    done_mask=done_mask,
+                    use_reset_info_for_done=False,
+                    joint_qpos_dim=amp_joint_qpos_dim,
+                    joint_qvel_dim=amp_joint_qvel_dim,
+                    include_root_height=bool(args.amp_include_root_height),
+                )
+                amp_policy_buffer.add_batch(amp_obs_t, amp_obs_t1_for_buffer)
 
-                obs_t_t = torch.as_tensor(amp_obs_t[None, :], dtype=torch.float32, device=device)
-                obs_t1_t = torch.as_tensor(amp_obs_t1[None, :], dtype=torch.float32, device=device)
+                obs_t_t = torch.as_tensor(amp_obs_t, dtype=torch.float32, device=device)
+                obs_t1_t = torch.as_tensor(amp_obs_t1_for_buffer, dtype=torch.float32, device=device)
                 with torch.no_grad():
                     d_score_t = amp_discriminator(obs_t_t, obs_t1_t)
                 d_score_np = d_score_t.detach().cpu().numpy().astype(np.float32)
@@ -588,24 +855,41 @@ def train(args: argparse.Namespace) -> None:
                         )
                     amp_style = amp_style_t.detach().cpu().numpy().astype(np.float32)
 
-                amp_reward_scalar = float(amp_style[0])
                 amp_weight = _amp_weight_for_stage(args, current_stage)
-                combined_reward = (1.0 - amp_weight) * task_reward + amp_weight * amp_reward_scalar
-                amp_reward_hist.append(amp_reward_scalar)
-                amp_weight_hist.append(amp_weight)
+                combined_reward_batch = (
+                    (1.0 - amp_weight) * task_reward_batch + amp_weight * amp_style
+                ).astype(np.float32)
+                amp_reward_hist.extend(amp_style.tolist())
+                amp_weight_hist.extend([float(amp_weight)] * num_envs)
                 if len(amp_reward_hist) > 20_000:
                     del amp_reward_hist[:-20_000]
                 if len(amp_weight_hist) > 20_000:
                     del amp_weight_hist[:-20_000]
 
-            done = bool(terminations["h0"] or truncations["h0"])
-            next_obs = np.asarray(next_obs_dict["h0"], dtype=np.float32)
-            replay.add(obs=obs, action=action, reward=combined_reward, next_obs=next_obs, done=done)
+                amp_obs_current = _compute_amp_obs_batch(
+                    raw_obs_batch=raw_next_obs_for_rollout,
+                    infos_payload=rollout_infos_payload,
+                    num_envs=num_envs,
+                    done_mask=done_mask,
+                    use_reset_info_for_done=(num_envs > 1),
+                    joint_qpos_dim=amp_joint_qpos_dim,
+                    joint_qvel_dim=amp_joint_qvel_dim,
+                    include_root_height=bool(args.amp_include_root_height),
+                )
 
-            ep_return += float(combined_reward)
-            ep_task_return += float(task_reward)
+            for env_idx in range(num_envs):
+                replay.add(
+                    obs=obs[env_idx],
+                    action=action[env_idx],
+                    reward=float(combined_reward_batch[env_idx]),
+                    next_obs=raw_next_obs_for_buffer[env_idx],
+                    done=bool(done_mask[env_idx]),
+                )
+
+            ep_return += combined_reward_batch
+            ep_task_return += task_reward_batch
             ep_len += 1
-            global_step += 1
+            global_step += num_envs
 
             if (
                 args.amp_enable
@@ -687,21 +971,20 @@ def train(args: argparse.Namespace) -> None:
                         _soft_update(actor_target, actor, args.tau)
                         _soft_update(critic_target, critic, args.tau)
 
-            if done:
-                termination_reason = str(infos["h0"].get("termination_reason", "unknown"))
-                completed_returns.append(float(ep_return))
-                completed_task_returns.append(float(ep_task_return))
-                completed_lengths.append(float(ep_len))
-                completed_successes.append(1.0 if termination_reason == "success" else 0.0)
+            for env_idx, done in enumerate(done_mask):
+                if not bool(done):
+                    continue
+                completed_returns.append(float(ep_return[env_idx]))
+                completed_task_returns.append(float(ep_task_return[env_idx]))
+                completed_lengths.append(float(ep_len[env_idx]))
+                completed_successes.append(1.0 if reasons[env_idx] == "success" else 0.0)
                 episodes_in_stage += 1
 
-                ep_return = 0.0
-                ep_task_return = 0.0
-                ep_len = 0
-                obs_dict, _ = env.reset(seed=None, options={"stage": int(current_stage)})
-                obs = np.asarray(obs_dict["h0"], dtype=np.float32)
-            else:
-                obs = next_obs
+                ep_return[env_idx] = 0.0
+                ep_task_return[env_idx] = 0.0
+                ep_len[env_idx] = 0
+
+            obs = raw_next_obs_for_rollout
 
             stage_up_msg = None
             if args.auto_curriculum and current_stage < max_stage:
@@ -720,8 +1003,19 @@ def train(args: argparse.Namespace) -> None:
                     prev_stage = current_stage
                     current_stage += 1
                     episodes_in_stage = 0
-                    obs_dict, _ = env.reset(seed=None, options={"stage": int(current_stage)})
-                    obs = np.asarray(obs_dict["h0"], dtype=np.float32)
+                    reset_obs, reset_infos = env.reset(seed=None, options={"stage": int(current_stage)})
+                    obs = np.asarray(_format_reset_obs(reset_obs, num_envs)["h0"], dtype=np.float32)
+                    if args.amp_enable:
+                        amp_obs_current = _compute_amp_obs_batch(
+                            raw_obs_batch=obs,
+                            infos_payload=reset_infos,
+                            num_envs=num_envs,
+                            done_mask=None,
+                            use_reset_info_for_done=False,
+                            joint_qpos_dim=amp_joint_qpos_dim,
+                            joint_qvel_dim=amp_joint_qvel_dim,
+                            include_root_height=bool(args.amp_include_root_height),
+                        )
                     stage_up_msg = (
                         f"curriculum: stage {prev_stage} -> {current_stage} "
                         f"(success_window={success_window:.2f} threshold={threshold:.2f})"
