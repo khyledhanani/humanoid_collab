@@ -1,4 +1,4 @@
-"""WGAN-GP style discriminator for Adversarial Motion Priors.
+"""Discriminator for Adversarial Motion Priors.
 
 The discriminator learns to distinguish between reference motion transitions
 (from motion capture data) and policy-generated transitions.
@@ -11,14 +11,15 @@ import torch.optim as optim
 
 
 class AMPDiscriminator(nn.Module):
-    """WGAN-GP discriminator for motion quality scoring.
+    """Discriminator for motion quality scoring.
 
     Takes state transitions (s_t, s_{t+1}) as input and outputs a scalar
     "realness" score. Higher scores indicate more natural motion.
 
-    The discriminator is trained with WGAN-GP objective:
-    - Maximize D(real) - D(fake)
-    - Gradient penalty on interpolated samples
+    The trainer supports both:
+    - ``wgan_gp``: maximize D(real) - D(fake)
+    - ``lsgan_gp``: least-squares real/fake targets (+1 / -1)
+    with gradient penalty on interpolated samples.
     """
 
     def __init__(
@@ -53,7 +54,7 @@ class AMPDiscriminator(nn.Module):
                 raise ValueError(f"Unknown activation: {activation}")
             prev_dim = h
 
-        # Output layer (no activation - raw score for WGAN)
+        # Output layer (no activation - raw score)
         layers.append(nn.Linear(prev_dim, 1))
 
         self.net = nn.Sequential(*layers)
@@ -126,7 +127,7 @@ def compute_gradient_penalty(
     fake_obs_t1: torch.Tensor,
     lambda_gp: float = 10.0,
 ) -> torch.Tensor:
-    """Compute gradient penalty for WGAN-GP training.
+    """Compute gradient penalty for AMP discriminator training.
 
     Interpolates between real and fake samples and penalizes gradients
     that deviate from unit norm.
@@ -178,7 +179,7 @@ def compute_gradient_penalty(
 
 
 class AMPDiscriminatorTrainer:
-    """Handles discriminator training with WGAN-GP."""
+    """Handles discriminator training with configurable objective."""
 
     def __init__(
         self,
@@ -187,6 +188,7 @@ class AMPDiscriminatorTrainer:
         betas: Tuple[float, float] = (0.5, 0.999),
         lambda_gp: float = 10.0,
         n_updates: int = 5,
+        objective: str = "wgan_gp",
         device: str = "cpu",
     ):
         """Initialize the trainer.
@@ -197,12 +199,17 @@ class AMPDiscriminatorTrainer:
             betas: Adam betas
             lambda_gp: Gradient penalty coefficient
             n_updates: Number of discriminator updates per batch
+            objective: One of {"wgan_gp", "lsgan_gp"}
             device: Device to train on
         """
+        if objective not in {"wgan_gp", "lsgan_gp"}:
+            raise ValueError(f"Unknown discriminator objective '{objective}'")
+
         self.discriminator = discriminator.to(device)
         self.device = device
         self.lambda_gp = lambda_gp
         self.n_updates = n_updates
+        self.objective = objective
 
         self.optimizer = optim.Adam(
             discriminator.parameters(),
@@ -238,6 +245,8 @@ class AMPDiscriminatorTrainer:
             "gp_loss": 0.0,
             "d_real": 0.0,
             "d_fake": 0.0,
+            "real_loss": 0.0,
+            "fake_loss": 0.0,
         }
 
         for _ in range(self.n_updates):
@@ -247,9 +256,16 @@ class AMPDiscriminatorTrainer:
             d_real = self.discriminator(real_obs_t, real_obs_t1)
             d_fake = self.discriminator(fake_obs_t, fake_obs_t1)
 
-            # WGAN loss: maximize D(real) - D(fake)
-            # Equivalently, minimize D(fake) - D(real)
-            disc_loss = d_fake.mean() - d_real.mean()
+            if self.objective == "lsgan_gp":
+                real_loss = 0.5 * ((d_real - 1.0) ** 2).mean()
+                fake_loss = 0.5 * ((d_fake + 1.0) ** 2).mean()
+                disc_loss = real_loss + fake_loss
+            else:
+                # WGAN loss: maximize D(real) - D(fake)
+                # Equivalently, minimize D(fake) - D(real)
+                real_loss = torch.zeros((), device=self.device)
+                fake_loss = torch.zeros((), device=self.device)
+                disc_loss = d_fake.mean() - d_real.mean()
 
             # Gradient penalty
             gp_loss = compute_gradient_penalty(
@@ -269,6 +285,8 @@ class AMPDiscriminatorTrainer:
             metrics["gp_loss"] += gp_loss.item() / self.n_updates
             metrics["d_real"] += d_real.mean().item() / self.n_updates
             metrics["d_fake"] += d_fake.mean().item() / self.n_updates
+            metrics["real_loss"] += real_loss.item() / self.n_updates
+            metrics["fake_loss"] += fake_loss.item() / self.n_updates
 
         return metrics
 

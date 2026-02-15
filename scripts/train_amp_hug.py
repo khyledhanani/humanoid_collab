@@ -94,6 +94,13 @@ def parse_args() -> argparse.Namespace:
 
     # Discriminator
     parser.add_argument("--disc-hidden-sizes", type=int, nargs="+", default=[1024, 512])
+    parser.add_argument(
+        "--disc-objective",
+        type=str,
+        default="lsgan_gp",
+        choices=["lsgan_gp", "wgan_gp"],
+        help="Discriminator objective. lsgan_gp matches AMP paper reward shaping.",
+    )
     parser.add_argument("--disc-lr", type=float, default=1e-4)
     parser.add_argument("--disc-batch-size", type=int, default=256)
     parser.add_argument("--n-disc-updates", type=int, default=5)
@@ -314,6 +321,7 @@ def train(args: argparse.Namespace) -> None:
             lr=args.disc_lr,
             lambda_gp=args.lambda_gp,
             n_updates=args.n_disc_updates,
+            objective=args.disc_objective,
             device=device_str,
         )
 
