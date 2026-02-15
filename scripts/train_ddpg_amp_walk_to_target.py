@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-normalize-reward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp-reward-anchor-momentum", type=float, default=0.05)
     parser.add_argument("--amp-weight-override", type=float, default=None)
-    parser.add_argument("--amp-weight-stage0", type=float, default=0.45)
+    parser.add_argument("--amp-weight-stage0", type=float, default=0.50)
     parser.add_argument("--amp-weight-stage1", type=float, default=0.40)
     parser.add_argument("--amp-weight-stage2", type=float, default=0.35)
     parser.add_argument("--amp-weight-stage3", type=float, default=0.30)

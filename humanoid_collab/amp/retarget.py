@@ -75,14 +75,14 @@ class SkeletonConfig:
                 "left_hip_x": (-25, 5),
                 "left_hip_z": (-60, 35),
                 "left_hip_y": (-110, 20),
-                "left_knee": (-160, -2),
+                "left_knee": (0, 160),
                 "left_ankle_roll": (-25, 25),
                 "left_ankle": (-50, 50),
                 "left_toe": (-35, 55),
                 "right_hip_x": (-25, 5),
                 "right_hip_z": (-60, 35),
                 "right_hip_y": (-110, 20),
-                "right_knee": (-160, -2),
+                "right_knee": (0, 160),
                 "right_ankle_roll": (-25, 25),
                 "right_ankle": (-50, 50),
                 "right_toe": (-35, 55),
@@ -235,7 +235,8 @@ def retarget_smpl_frame(
     # Left knee
     l_knee_aa = pose[SMPL_JOINTS["l_knee"] * 3:(SMPL_JOINTS["l_knee"] + 1) * 3]
     l_knee_euler = axis_angle_to_euler(l_knee_aa)
-    qpos[12] = np.clip(l_knee_euler[1], np.radians(-160), np.radians(-2))  # left_knee
+    # MuJoCo knee flexion is positive (range [0, 160] deg). SMPL knee flexion comes out negative here.
+    qpos[12] = np.clip(-l_knee_euler[1], np.radians(0), np.radians(160))  # left_knee
 
     # Left ankle complex
     l_ankle_aa = pose[SMPL_JOINTS["l_ankle"] * 3:(SMPL_JOINTS["l_ankle"] + 1) * 3]
@@ -256,7 +257,7 @@ def retarget_smpl_frame(
     # Right knee
     r_knee_aa = pose[SMPL_JOINTS["r_knee"] * 3:(SMPL_JOINTS["r_knee"] + 1) * 3]
     r_knee_euler = axis_angle_to_euler(r_knee_aa)
-    qpos[19] = np.clip(r_knee_euler[1], np.radians(-160), np.radians(-2))  # right_knee
+    qpos[19] = np.clip(-r_knee_euler[1], np.radians(0), np.radians(160))  # right_knee
 
     # Right ankle complex
     r_ankle_aa = pose[SMPL_JOINTS["r_ankle"] * 3:(SMPL_JOINTS["r_ankle"] + 1) * 3]

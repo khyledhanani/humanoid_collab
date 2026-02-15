@@ -128,7 +128,7 @@ def _humanoid_body(
 
           <body name="{prefix}_left_shin" pos="0 0.01 -0.403">
             <inertial pos="0 0 -0.16" mass="2.6" diaginertia="0.030 0.028 0.006"/>
-            <joint name="{prefix}_left_knee" type="hinge" axis="0 1 0" range="-160 -2" armature="0.006"/>
+            <joint name="{prefix}_left_knee" type="hinge" axis="0 1 0" range="0 160" armature="0.006"/>
             <geom name="{prefix}_left_shin_geom" fromto="0 0 0 0 0 -0.3" size="0.049" type="capsule" material="{material}"/>
 
             <body name="{prefix}_left_ankle_roll_link" pos="0 0 -0.35">
@@ -160,7 +160,7 @@ def _humanoid_body(
 
           <body name="{prefix}_right_shin" pos="0 -0.01 -0.403">
             <inertial pos="0 0 -0.16" mass="2.6" diaginertia="0.030 0.028 0.006"/>
-            <joint name="{prefix}_right_knee" type="hinge" axis="0 1 0" range="-160 -2" armature="0.006"/>
+            <joint name="{prefix}_right_knee" type="hinge" axis="0 1 0" range="0 160" armature="0.006"/>
             <geom name="{prefix}_right_shin_geom" fromto="0 0 0 0 0 -0.3" size="0.049" type="capsule" material="{material}"/>
 
             <body name="{prefix}_right_ankle_roll_link" pos="0 0 -0.35">
