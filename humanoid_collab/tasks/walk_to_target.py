@@ -24,6 +24,8 @@ _WALK_STAGES = {
         w_progress=18.0,
         w_distance=0.8,
         w_heading=0.35,
+        # Penalize moving backward in the torso local frame (prevents learning to backpedal/crab-walk).
+        w_backpedal=-0.35,
         w_arrival=0.8,
         w_stop=0.25,
         w_face=0.12,
@@ -40,6 +42,7 @@ _WALK_STAGES = {
         w_progress=16.0,
         w_distance=0.7,
         w_heading=0.32,
+        w_backpedal=-0.35,
         w_arrival=1.0,
         w_stop=0.45,
         w_face=0.18,
@@ -56,6 +59,7 @@ _WALK_STAGES = {
         w_progress=14.0,
         w_distance=0.6,
         w_heading=0.3,
+        w_backpedal=-0.35,
         w_arrival=1.2,
         w_stop=0.75,
         w_face=0.24,
@@ -72,6 +76,7 @@ _WALK_STAGES = {
         w_progress=12.0,
         w_distance=0.5,
         w_heading=0.28,
+        w_backpedal=-0.35,
         w_arrival=1.5,
         w_stop=1.0,
         w_face=0.3,
@@ -286,6 +291,7 @@ class WalkToTargetTask(TaskConfig):
         tilt = float(metrics["tilt"])
         upright_score = float(metrics["upright_score"])
         arrival_gate = 1.0 if dist_xy < thresholds["arrival_dist"] else 0.0
+        vel_local_x = float(np.asarray(metrics["vel_local"])[0])
 
         if self._prev_dist is None:
             progress = 0.0
@@ -296,12 +302,16 @@ class WalkToTargetTask(TaskConfig):
 
         r_progress = w["w_progress"] * progress
         r_distance = w["w_distance"] * np.exp(-w["distance_scale"] * dist_xy)
-        r_heading = w["w_heading"] * max(0.0, heading)
+        # Penalize facing away from the target (negative heading), otherwise policies can
+        # optimize pure distance progress while walking "backwards" relative to the torso.
+        r_heading = w["w_heading"] * float(np.clip(heading, -1.0, 1.0))
         r_arrival = w["w_arrival"] * arrival_gate
         r_stop = w["w_stop"] * arrival_gate * np.exp(-6.0 * speed_xy)
         r_face = w["w_face"] * arrival_gate * max(0.0, heading)
         r_upright = w["w_upright"] * upright_score
         r_time = float(w.get("w_time", 0.0))
+        # Discourage moving opposite the torso forward axis except when already in the arrival zone.
+        r_backpedal = w.get("w_backpedal", 0.0) * (1.0 - arrival_gate) * max(0.0, -vel_local_x)
         r_energy = w["w_energy"] * float(np.sum(np.square(ctrl)))
         r_impact = w["w_impact"] * float(contact_force_proxy)
 
@@ -314,6 +324,7 @@ class WalkToTargetTask(TaskConfig):
             + r_face
             + r_upright
             + r_time
+            + r_backpedal
             + r_energy
             + r_impact
         )
@@ -334,6 +345,7 @@ class WalkToTargetTask(TaskConfig):
             "walk_dist_xy": dist_xy,
             "walk_heading_alignment": heading,
             "walk_speed_xy": speed_xy,
+            "walk_vel_local_x": vel_local_x,
             "walk_tilt": tilt,
             "walk_arrival_gate": arrival_gate,
             "r_progress": r_progress,
@@ -344,6 +356,7 @@ class WalkToTargetTask(TaskConfig):
             "r_face": r_face,
             "r_upright": r_upright,
             "r_time": r_time,
+            "r_backpedal": r_backpedal,
             "r_energy": r_energy,
             "r_impact": r_impact,
             "r_fall": r_fall,
