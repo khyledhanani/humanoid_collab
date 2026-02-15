@@ -111,6 +111,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-weight-stage1", type=float, default=0.40)
     parser.add_argument("--amp-weight-stage2", type=float, default=0.35)
     parser.add_argument("--amp-weight-stage3", type=float, default=0.30)
+    parser.add_argument(
+        "--amp-anneal-steps",
+        type=int,
+        default=0,
+        help="If > 0, linearly anneal AMP reward weight over this many env steps.",
+    )
+    parser.add_argument(
+        "--amp-anneal-begin-step",
+        type=int,
+        default=0,
+        help="Env step at which AMP annealing starts (default: 0).",
+    )
+    parser.add_argument(
+        "--amp-anneal-start-weight",
+        type=float,
+        default=None,
+        help="Starting AMP weight for anneal (default: stage weight or override).",
+    )
+    parser.add_argument(
+        "--amp-anneal-end-weight",
+        type=float,
+        default=None,
+        help="Final AMP weight for anneal (default: 0.0).",
+    )
 
     parser.add_argument("--auto-curriculum", action="store_true")
     parser.add_argument("--curriculum-window-episodes", type=int, default=80)
@@ -249,6 +273,25 @@ def _amp_weight_for_stage(args: argparse.Namespace, stage: int) -> float:
         3: float(args.amp_weight_stage3),
     }
     return float(by_stage.get(int(stage), args.amp_weight_stage3))
+
+
+def _amp_weight(args: argparse.Namespace, stage: int, global_step: int) -> float:
+    """Compute AMP blend weight, optionally linearly annealed over env steps."""
+    base = _amp_weight_for_stage(args, stage)
+    anneal_steps = int(getattr(args, "amp_anneal_steps", 0) or 0)
+    if anneal_steps <= 0:
+        return float(np.clip(base, 0.0, 1.0))
+
+    begin = int(getattr(args, "amp_anneal_begin_step", 0) or 0)
+    start_w = getattr(args, "amp_anneal_start_weight", None)
+    end_w = getattr(args, "amp_anneal_end_weight", None)
+    start = float(base if start_w is None else start_w)
+    end = float(0.0 if end_w is None else end_w)
+
+    t = max(0, int(global_step) - begin)
+    frac = float(np.clip(t / max(1, anneal_steps), 0.0, 1.0))
+    w = start + frac * (end - start)
+    return float(np.clip(w, 0.0, 1.0))
 
 
 def _resolve_curriculum_threshold(
@@ -683,6 +726,8 @@ def train(args: argparse.Namespace) -> None:
     q_hist: List[float] = []
     amp_reward_hist: List[float] = []
     amp_weight_hist: List[float] = []
+    amp_weighted_reward_hist: List[float] = []
+    task_weighted_reward_hist: List[float] = []
     amp_disc_loss_hist: List[float] = []
     amp_d_real_hist: List[float] = []
     amp_d_fake_hist: List[float] = []
@@ -855,16 +900,22 @@ def train(args: argparse.Namespace) -> None:
                         )
                     amp_style = amp_style_t.detach().cpu().numpy().astype(np.float32)
 
-                amp_weight = _amp_weight_for_stage(args, current_stage)
+                amp_weight = _amp_weight(args, current_stage, global_step)
                 combined_reward_batch = (
                     (1.0 - amp_weight) * task_reward_batch + amp_weight * amp_style
                 ).astype(np.float32)
                 amp_reward_hist.extend(amp_style.tolist())
                 amp_weight_hist.extend([float(amp_weight)] * num_envs)
+                amp_weighted_reward_hist.extend((amp_weight * amp_style).tolist())
+                task_weighted_reward_hist.extend(((1.0 - amp_weight) * task_reward_batch).tolist())
                 if len(amp_reward_hist) > 20_000:
                     del amp_reward_hist[:-20_000]
                 if len(amp_weight_hist) > 20_000:
                     del amp_weight_hist[:-20_000]
+                if len(amp_weighted_reward_hist) > 20_000:
+                    del amp_weighted_reward_hist[:-20_000]
+                if len(task_weighted_reward_hist) > 20_000:
+                    del task_weighted_reward_hist[:-20_000]
 
                 amp_obs_current = _compute_amp_obs_batch(
                     raw_obs_batch=raw_next_obs_for_rollout,
@@ -1036,6 +1087,12 @@ def train(args: argparse.Namespace) -> None:
                 a_loss = float(np.mean(actor_loss_hist[-100:])) if actor_loss_hist else 0.0
                 amp_reward_mean = float(np.mean(amp_reward_hist[-2000:])) if amp_reward_hist else 0.0
                 amp_weight_mean = float(np.mean(amp_weight_hist[-2000:])) if amp_weight_hist else 0.0
+                amp_weighted_mean = (
+                    float(np.mean(amp_weighted_reward_hist[-2000:])) if amp_weighted_reward_hist else 0.0
+                )
+                task_weighted_mean = (
+                    float(np.mean(task_weighted_reward_hist[-2000:])) if task_weighted_reward_hist else 0.0
+                )
                 amp_disc_loss = float(np.mean(amp_disc_loss_hist[-100:])) if amp_disc_loss_hist else 0.0
                 amp_d_real = float(np.mean(amp_d_real_hist[-100:])) if amp_d_real_hist else 0.0
                 amp_d_fake = float(np.mean(amp_d_fake_hist[-100:])) if amp_d_fake_hist else 0.0
@@ -1049,6 +1106,7 @@ def train(args: argparse.Namespace) -> None:
                 if args.amp_enable:
                     msg += (
                         f" amp_w={amp_weight_mean:.2f} amp_r={amp_reward_mean:.3f} "
+                        f"amp_w*r={amp_weighted_mean:.3f} task_w*r={task_weighted_mean:.3f} "
                         f"d_loss={amp_disc_loss:.4f} d_real={amp_d_real:.3f} d_fake={amp_d_fake:.3f}"
                     )
                 print(msg)
@@ -1071,6 +1129,8 @@ def train(args: argparse.Namespace) -> None:
                 if args.amp_enable:
                     algo_metrics["amp_weight_mean"] = amp_weight_mean
                     algo_metrics["amp_reward_mean"] = amp_reward_mean
+                    algo_metrics["amp_weighted_reward_mean"] = amp_weighted_mean
+                    algo_metrics["task_weighted_reward_mean"] = task_weighted_mean
                     algo_metrics["amp_disc_loss"] = amp_disc_loss
                     algo_metrics["amp_d_real"] = amp_d_real
                     algo_metrics["amp_d_fake"] = amp_d_fake
