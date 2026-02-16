@@ -81,6 +81,7 @@ python scripts/render_maddpg.py --checkpoint checkpoints/maddpg_handshake_fixed_
 python scripts/train_ddpg_amp_walk_to_target.py --amp-motion-data-dir data/amp_processed --amp-disc-checkpoint checkpoints/amp_pretrain/discriminator_latest.pt --total-steps 1000000 --device cuda
 python scripts/train_sac_amp_walk_to_target.py --amp-motion-data-dir data/amp_processed --amp-disc-checkpoint checkpoints/amp_pretrain/discriminator_latest.pt --amp-freeze-discriminator --total-steps 1000000 --device cuda
 python scripts/render_ddpg_amp_walk_to_target.py --checkpoint checkpoints/ddpg_amp_walk_to_target/latest.pt --episodes 3
+python scripts/render_sac_amp_walk_to_target.py --checkpoint checkpoints/sac_amp_walk_to_target/latest.pt --episodes 3
 ```
 
 Available physics profiles: `default`, `balanced`, `train_fast`.
