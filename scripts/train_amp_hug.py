@@ -110,7 +110,11 @@ def parse_args() -> argparse.Namespace:
 
     # AMP reward
     parser.add_argument("--amp-reward-scale", type=float, default=2.0)
-    parser.add_argument("--clip-amp-reward", action="store_true", default=True)
+    parser.add_argument(
+        "--clip-amp-reward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--amp-weight-override", type=float, default=None,
                         help="Override curriculum AMP weights with fixed value")
     parser.add_argument(

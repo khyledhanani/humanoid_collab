@@ -100,7 +100,11 @@ def parse_args() -> argparse.Namespace:
 
     # AMP reward
     parser.add_argument("--amp-reward-scale", type=float, default=2.0)
-    parser.add_argument("--clip-amp-reward", action="store_true", default=True)
+    parser.add_argument(
+        "--clip-amp-reward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--alive-bonus", type=float, default=0.1)
     parser.add_argument("--energy-penalty", type=float, default=0.0005)
     parser.add_argument("--fall-penalty", type=float, default=10.0)

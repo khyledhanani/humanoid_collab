@@ -7,18 +7,16 @@ SMPL skeleton has 24 joints in the following order:
 18: L_Elbow, 19: R_Elbow, 20: L_Wrist, 21: R_Wrist, 22: L_Hand, 23: R_Hand
 
 MuJoCo humanoid joint order (for one agent, qpos after root 7 DoF):
-0: abdomen_z, 1: abdomen_y
-2: left_hip_x, 3: left_hip_z, 4: left_hip_y
-5: left_knee
-6: left_ankle_roll, 7: left_ankle, 8: left_toe
-9: right_hip_x, 10: right_hip_z, 11: right_hip_y
-12: right_knee
-13: right_ankle_roll, 14: right_ankle, 15: right_toe
-16: left_shoulder1, 17: left_shoulder2
-18: left_elbow
-19: right_shoulder1, 20: right_shoulder2
-21: right_elbow
-22: head_yaw, 23: head_pitch
+0: head_yaw, 1: head_pitch
+2: left_shoulder1, 3: left_shoulder2, 4: left_elbow
+5: right_shoulder1, 6: right_shoulder2, 7: right_elbow
+8: abdomen_z, 9: abdomen_y
+10: left_hip_x, 11: left_hip_z, 12: left_hip_y
+13: left_knee
+14: left_ankle_roll, 15: left_ankle, 16: left_toe
+17: right_hip_x, 18: right_hip_z, 19: right_hip_y
+20: right_knee
+21: right_ankle_roll, 22: right_ankle, 23: right_toe
 """
 
 from dataclasses import dataclass
@@ -46,6 +44,11 @@ class SkeletonConfig:
 
     # Joint names in qpos order (after root)
     joint_names: Tuple[str, ...] = (
+        "head_yaw", "head_pitch",
+        "left_shoulder1", "left_shoulder2",
+        "left_elbow",
+        "right_shoulder1", "right_shoulder2",
+        "right_elbow",
         "abdomen_z", "abdomen_y",
         "left_hip_x", "left_hip_z", "left_hip_y",
         "left_knee",
@@ -57,11 +60,6 @@ class SkeletonConfig:
         "right_ankle_roll",
         "right_ankle",
         "right_toe",
-        "left_shoulder1", "left_shoulder2",
-        "left_elbow",
-        "right_shoulder1", "right_shoulder2",
-        "right_elbow",
-        "head_yaw", "head_pitch",
     )
 
     # Joint limits (degrees) - matches MJCF
@@ -218,83 +216,91 @@ def retarget_smpl_frame(
     root_axis_angle = pose[0:3]
     qpos[3:7] = axis_angle_to_quat(root_axis_angle)
 
-    # Map SMPL joints to MuJoCo joints
+    # Map SMPL joints to MuJoCo joints. We first compute joint angles by name,
+    # then pack them in exact model qpos order from skeleton.joint_names.
+    joint_angles: Dict[str, float] = {}
+
     # Abdomen (from spine1)
     spine_aa = pose[SMPL_JOINTS["spine1"] * 3:(SMPL_JOINTS["spine1"] + 1) * 3]
     spine_euler = axis_angle_to_euler(spine_aa)
-    qpos[7] = np.clip(spine_euler[2], np.radians(-45), np.radians(45))   # abdomen_z
-    qpos[8] = np.clip(spine_euler[1], np.radians(-75), np.radians(30))   # abdomen_y
+    joint_angles["abdomen_z"] = np.clip(spine_euler[2], np.radians(-45), np.radians(45))
+    joint_angles["abdomen_y"] = np.clip(spine_euler[1], np.radians(-75), np.radians(30))
 
     # Left hip (3 DoF)
     l_hip_aa = pose[SMPL_JOINTS["l_hip"] * 3:(SMPL_JOINTS["l_hip"] + 1) * 3]
     l_hip_euler = axis_angle_to_euler(l_hip_aa)
-    qpos[9] = np.clip(l_hip_euler[0], np.radians(-25), np.radians(5))    # left_hip_x
-    qpos[10] = np.clip(l_hip_euler[2], np.radians(-60), np.radians(35))  # left_hip_z
-    qpos[11] = np.clip(l_hip_euler[1], np.radians(-110), np.radians(20)) # left_hip_y
+    joint_angles["left_hip_x"] = np.clip(l_hip_euler[0], np.radians(-25), np.radians(5))
+    joint_angles["left_hip_z"] = np.clip(l_hip_euler[2], np.radians(-60), np.radians(35))
+    joint_angles["left_hip_y"] = np.clip(l_hip_euler[1], np.radians(-110), np.radians(20))
 
     # Left knee
     l_knee_aa = pose[SMPL_JOINTS["l_knee"] * 3:(SMPL_JOINTS["l_knee"] + 1) * 3]
     l_knee_euler = axis_angle_to_euler(l_knee_aa)
     # MuJoCo knee flexion is positive (range [0, 160] deg). SMPL knee flexion comes out negative here.
-    qpos[12] = np.clip(-l_knee_euler[1], np.radians(0), np.radians(160))  # left_knee
+    joint_angles["left_knee"] = np.clip(-l_knee_euler[1], np.radians(0), np.radians(160))
 
     # Left ankle complex
     l_ankle_aa = pose[SMPL_JOINTS["l_ankle"] * 3:(SMPL_JOINTS["l_ankle"] + 1) * 3]
     l_ankle_euler = axis_angle_to_euler(l_ankle_aa)
-    qpos[13] = np.clip(l_ankle_euler[0], np.radians(-25), np.radians(25))   # left_ankle_roll
-    qpos[14] = np.clip(l_ankle_euler[1], np.radians(-50), np.radians(50))   # left_ankle
+    joint_angles["left_ankle_roll"] = np.clip(l_ankle_euler[0], np.radians(-25), np.radians(25))
+    joint_angles["left_ankle"] = np.clip(l_ankle_euler[1], np.radians(-50), np.radians(50))
     l_foot_aa = pose[SMPL_JOINTS["l_foot"] * 3:(SMPL_JOINTS["l_foot"] + 1) * 3]
     l_foot_euler = axis_angle_to_euler(l_foot_aa)
-    qpos[15] = np.clip(l_foot_euler[1], np.radians(-35), np.radians(55))    # left_toe
+    joint_angles["left_toe"] = np.clip(l_foot_euler[1], np.radians(-35), np.radians(55))
 
     # Right hip (3 DoF)
     r_hip_aa = pose[SMPL_JOINTS["r_hip"] * 3:(SMPL_JOINTS["r_hip"] + 1) * 3]
     r_hip_euler = axis_angle_to_euler(r_hip_aa)
-    qpos[16] = np.clip(-r_hip_euler[0], np.radians(-25), np.radians(5))   # right_hip_x (negated)
-    qpos[17] = np.clip(-r_hip_euler[2], np.radians(-60), np.radians(35))  # right_hip_z (negated)
-    qpos[18] = np.clip(r_hip_euler[1], np.radians(-110), np.radians(20))  # right_hip_y
+    joint_angles["right_hip_x"] = np.clip(-r_hip_euler[0], np.radians(-25), np.radians(5))
+    joint_angles["right_hip_z"] = np.clip(-r_hip_euler[2], np.radians(-60), np.radians(35))
+    joint_angles["right_hip_y"] = np.clip(r_hip_euler[1], np.radians(-110), np.radians(20))
 
     # Right knee
     r_knee_aa = pose[SMPL_JOINTS["r_knee"] * 3:(SMPL_JOINTS["r_knee"] + 1) * 3]
     r_knee_euler = axis_angle_to_euler(r_knee_aa)
-    qpos[19] = np.clip(-r_knee_euler[1], np.radians(0), np.radians(160))  # right_knee
+    joint_angles["right_knee"] = np.clip(-r_knee_euler[1], np.radians(0), np.radians(160))
 
     # Right ankle complex
     r_ankle_aa = pose[SMPL_JOINTS["r_ankle"] * 3:(SMPL_JOINTS["r_ankle"] + 1) * 3]
     r_ankle_euler = axis_angle_to_euler(r_ankle_aa)
-    qpos[20] = np.clip(-r_ankle_euler[0], np.radians(-25), np.radians(25))  # right_ankle_roll
-    qpos[21] = np.clip(r_ankle_euler[1], np.radians(-50), np.radians(50))   # right_ankle
+    joint_angles["right_ankle_roll"] = np.clip(-r_ankle_euler[0], np.radians(-25), np.radians(25))
+    joint_angles["right_ankle"] = np.clip(r_ankle_euler[1], np.radians(-50), np.radians(50))
     r_foot_aa = pose[SMPL_JOINTS["r_foot"] * 3:(SMPL_JOINTS["r_foot"] + 1) * 3]
     r_foot_euler = axis_angle_to_euler(r_foot_aa)
-    qpos[22] = np.clip(r_foot_euler[1], np.radians(-35), np.radians(55))    # right_toe
+    joint_angles["right_toe"] = np.clip(r_foot_euler[1], np.radians(-35), np.radians(55))
 
     # Left shoulder (2 DoF)
     l_shoulder_aa = pose[SMPL_JOINTS["l_shoulder"] * 3:(SMPL_JOINTS["l_shoulder"] + 1) * 3]
     l_shoulder_euler = axis_angle_to_euler(l_shoulder_aa)
-    qpos[23] = np.clip(l_shoulder_euler[0], np.radians(-85), np.radians(60))  # left_shoulder1
-    qpos[24] = np.clip(l_shoulder_euler[1], np.radians(-85), np.radians(60))  # left_shoulder2
+    joint_angles["left_shoulder1"] = np.clip(l_shoulder_euler[0], np.radians(-85), np.radians(60))
+    joint_angles["left_shoulder2"] = np.clip(l_shoulder_euler[1], np.radians(-85), np.radians(60))
 
     # Left elbow
     l_elbow_aa = pose[SMPL_JOINTS["l_elbow"] * 3:(SMPL_JOINTS["l_elbow"] + 1) * 3]
     l_elbow_euler = axis_angle_to_euler(l_elbow_aa)
-    qpos[25] = np.clip(l_elbow_euler[1], np.radians(-90), np.radians(50))  # left_elbow
+    joint_angles["left_elbow"] = np.clip(l_elbow_euler[1], np.radians(-90), np.radians(50))
 
     # Right shoulder (2 DoF)
     r_shoulder_aa = pose[SMPL_JOINTS["r_shoulder"] * 3:(SMPL_JOINTS["r_shoulder"] + 1) * 3]
     r_shoulder_euler = axis_angle_to_euler(r_shoulder_aa)
-    qpos[26] = np.clip(r_shoulder_euler[0], np.radians(-60), np.radians(85))  # right_shoulder1
-    qpos[27] = np.clip(r_shoulder_euler[1], np.radians(-60), np.radians(85))  # right_shoulder2
+    joint_angles["right_shoulder1"] = np.clip(r_shoulder_euler[0], np.radians(-60), np.radians(85))
+    joint_angles["right_shoulder2"] = np.clip(r_shoulder_euler[1], np.radians(-60), np.radians(85))
 
     # Right elbow
     r_elbow_aa = pose[SMPL_JOINTS["r_elbow"] * 3:(SMPL_JOINTS["r_elbow"] + 1) * 3]
     r_elbow_euler = axis_angle_to_euler(r_elbow_aa)
-    qpos[28] = np.clip(r_elbow_euler[1], np.radians(-90), np.radians(50))  # right_elbow
+    joint_angles["right_elbow"] = np.clip(r_elbow_euler[1], np.radians(-90), np.radians(50))
 
     # Head (2 DoF)
     head_aa = pose[SMPL_JOINTS["head"] * 3:(SMPL_JOINTS["head"] + 1) * 3]
     head_euler = axis_angle_to_euler(head_aa)
-    qpos[29] = np.clip(head_euler[2], np.radians(-50), np.radians(50))  # head_yaw
-    qpos[30] = np.clip(head_euler[1], np.radians(-30), np.radians(30))  # head_pitch
+    joint_angles["head_yaw"] = np.clip(head_euler[2], np.radians(-50), np.radians(50))
+    joint_angles["head_pitch"] = np.clip(head_euler[1], np.radians(-30), np.radians(30))
+
+    for joint_offset, joint_name in enumerate(skeleton.joint_names):
+        if joint_name not in joint_angles:
+            raise KeyError(f"Missing retargeted joint angle for '{joint_name}'")
+        qpos[7 + joint_offset] = joint_angles[joint_name]
 
     return qpos
 
