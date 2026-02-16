@@ -121,7 +121,10 @@ class AMPObsBuilder:
 
         # Root orientation
         if self.include_root_orientation:
-            xmat = self.id_cache.get_torso_xmat(data, agent)
+            # Use root free-joint quaternion so live-policy and offline-motion
+            # AMP features are built from the same representation.
+            root_quat = data.qpos[qpos_idx[3:7]]
+            xmat = quat_to_mat(root_quat)
 
             # Forward vector
             fwd = get_forward_vector(xmat)
