@@ -21,7 +21,7 @@ from humanoid_collab.utils.kinematics import (
 
 _WALK_STAGES = {
     0: dict(
-        w_progress=18.0,
+        w_progress=12.0,
         w_distance=0.8,
         w_heading=0.35,
         # Penalize moving backward in the torso local frame (prevents learning to backpedal/crab-walk).
@@ -29,30 +29,32 @@ _WALK_STAGES = {
         w_arrival=0.8,
         w_stop=0.25,
         w_face=0.12,
-        w_upright=0.2,
+        w_upright=0.8,
+        w_unstable=-2.0,
         w_time=-0.01,
         w_energy=-0.0008,
         w_impact=-0.004,
-        w_fall=-20.0,
+        w_fall=-40.0,
         r_success=120.0,
-        progress_clip=0.10,
+        progress_clip=0.04,
         distance_scale=1.2,
     ),
     1: dict(
-        w_progress=16.0,
+        w_progress=14.0,
         w_distance=0.7,
         w_heading=0.32,
         w_backpedal=-0.35,
         w_arrival=1.0,
         w_stop=0.45,
         w_face=0.18,
-        w_upright=0.25,
+        w_upright=0.6,
+        w_unstable=-1.5,
         w_time=-0.01,
         w_energy=-0.0008,
         w_impact=-0.004,
-        w_fall=-22.0,
+        w_fall=-34.0,
         r_success=150.0,
-        progress_clip=0.08,
+        progress_clip=0.06,
         distance_scale=1.3,
     ),
     2: dict(
@@ -301,6 +303,7 @@ class WalkToTargetTask(TaskConfig):
         upright_score = float(metrics["upright_score"])
         arrival_gate = 1.0 if dist_xy < thresholds["arrival_dist"] else 0.0
         vel_local_x = float(np.asarray(metrics["vel_local"])[0])
+        torso_z = float(id_cache.get_torso_xpos(data, "h0")[2])
 
         if self._prev_dist is None:
             progress = 0.0
@@ -309,15 +312,22 @@ class WalkToTargetTask(TaskConfig):
         progress = float(np.clip(progress, -w["progress_clip"], w["progress_clip"]))
         self._prev_dist = dist_xy
 
-        r_progress = w["w_progress"] * progress
-        r_distance = w["w_distance"] * np.exp(-w["distance_scale"] * dist_xy)
+        # Gate positive shaping by stability so "lunge/dive then fall" can't be optimal.
+        tilt_gate = float(np.clip((_UPRIGHT_TILT_THRESH - tilt) / _UPRIGHT_TILT_THRESH, 0.0, 1.0))
+        height_gate = float(np.clip((torso_z - 0.5) / 0.35, 0.0, 1.0))
+        stability_gate = float(tilt_gate * height_gate)
+
+        r_progress = w["w_progress"] * progress * stability_gate
+        r_distance = w["w_distance"] * np.exp(-w["distance_scale"] * dist_xy) * stability_gate
         # Penalize facing away from the target (negative heading), otherwise policies can
         # optimize pure distance progress while walking "backwards" relative to the torso.
-        r_heading = w["w_heading"] * float(np.clip(heading, -1.0, 1.0))
-        r_arrival = w["w_arrival"] * arrival_gate
-        r_stop = w["w_stop"] * arrival_gate * np.exp(-6.0 * speed_xy)
-        r_face = w["w_face"] * arrival_gate * max(0.0, heading)
+        r_heading = w["w_heading"] * float(np.clip(heading, -1.0, 1.0)) * stability_gate
+        r_arrival = w["w_arrival"] * arrival_gate * stability_gate
+        r_stop = w["w_stop"] * arrival_gate * np.exp(-6.0 * speed_xy) * stability_gate
+        r_face = w["w_face"] * arrival_gate * max(0.0, heading) * stability_gate
         r_upright = w["w_upright"] * upright_score
+        # Per-step penalty once posture becomes unstable (acts before the termination threshold).
+        r_unstable = float(w.get("w_unstable", 0.0)) * max(0.0, tilt - 0.35)
         r_time = float(w.get("w_time", 0.0))
         # Discourage moving opposite the torso forward axis except when already in the arrival zone.
         r_backpedal = w.get("w_backpedal", 0.0) * (1.0 - arrival_gate) * max(0.0, -vel_local_x)
@@ -332,6 +342,7 @@ class WalkToTargetTask(TaskConfig):
             + r_stop
             + r_face
             + r_upright
+            + r_unstable
             + r_time
             + r_backpedal
             + r_energy
@@ -355,8 +366,12 @@ class WalkToTargetTask(TaskConfig):
             "walk_heading_alignment": heading,
             "walk_speed_xy": speed_xy,
             "walk_vel_local_x": vel_local_x,
+            "walk_torso_z": torso_z,
             "walk_tilt": tilt,
             "walk_arrival_gate": arrival_gate,
+            "walk_stability_gate": stability_gate,
+            "walk_tilt_gate": tilt_gate,
+            "walk_height_gate": height_gate,
             "r_progress": r_progress,
             "r_distance": r_distance,
             "r_heading": r_heading,
@@ -364,6 +379,7 @@ class WalkToTargetTask(TaskConfig):
             "r_stop": r_stop,
             "r_face": r_face,
             "r_upright": r_upright,
+            "r_unstable": r_unstable,
             "r_time": r_time,
             "r_backpedal": r_backpedal,
             "r_energy": r_energy,

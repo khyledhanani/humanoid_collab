@@ -783,6 +783,7 @@ def train(args: argparse.Namespace) -> None:
     amp_disc_loss_hist: List[float] = []
     amp_d_real_hist: List[float] = []
     amp_d_fake_hist: List[float] = []
+    amp_weight_eff_hist: List[float] = []
 
     ep_return = np.zeros((num_envs,), dtype=np.float32)
     ep_task_return = np.zeros((num_envs,), dtype=np.float32)
@@ -966,17 +967,38 @@ def train(args: argparse.Namespace) -> None:
                     amp_style = amp_style_t.detach().cpu().numpy().astype(np.float32)
 
                 amp_weight = _amp_weight(args, current_stage, global_step)
+
+                # Stability-gate AMP weight so the discriminator cannot reward unstable falling
+                # behaviors throughout an episode (not just the terminal fall transition).
+                tilt_vals: List[float] = []
+                height_vals: List[float] = []
+                for info_env in infos_list:
+                    h0_info = info_env.get("h0", {}) if isinstance(info_env, dict) else {}
+                    tilt_vals.append(float(h0_info.get("walk_tilt", 0.0)))
+                    height_vals.append(float(h0_info.get("root_height", 0.0)))
+                tilt = np.asarray(tilt_vals, dtype=np.float32)
+                root_h = np.asarray(height_vals, dtype=np.float32)
+
+                # Use the same upright threshold as the task's success condition.
+                tilt_gate = np.clip((0.55 - tilt) / 0.55, 0.0, 1.0)
+                height_gate = np.clip((root_h - 0.5) / 0.35, 0.0, 1.0)
+                stability_gate = (tilt_gate * height_gate).astype(np.float32)
+
+                amp_weight_eff = float(amp_weight) * stability_gate
                 combined_reward_batch = (
-                    (1.0 - amp_weight) * task_reward_batch + amp_weight * amp_style
+                    (1.0 - amp_weight_eff) * task_reward_batch + amp_weight_eff * amp_style
                 ).astype(np.float32)
                 amp_reward_hist.extend(amp_style.tolist())
                 amp_weight_hist.extend([float(amp_weight)] * num_envs)
+                amp_weight_eff_hist.extend(amp_weight_eff.tolist())
                 amp_weighted_reward_hist.extend((amp_weight * amp_style).tolist())
                 task_weighted_reward_hist.extend(((1.0 - amp_weight) * task_reward_batch).tolist())
                 if len(amp_reward_hist) > 20_000:
                     del amp_reward_hist[:-20_000]
                 if len(amp_weight_hist) > 20_000:
                     del amp_weight_hist[:-20_000]
+                if len(amp_weight_eff_hist) > 20_000:
+                    del amp_weight_eff_hist[:-20_000]
                 if len(amp_weighted_reward_hist) > 20_000:
                     del amp_weighted_reward_hist[:-20_000]
                 if len(task_weighted_reward_hist) > 20_000:
@@ -1191,6 +1213,9 @@ def train(args: argparse.Namespace) -> None:
                 alpha_value = float(log_alpha.exp().item())
                 amp_reward_mean = float(np.mean(amp_reward_hist[-2000:])) if amp_reward_hist else 0.0
                 amp_weight_mean = float(np.mean(amp_weight_hist[-2000:])) if amp_weight_hist else 0.0
+                amp_weight_eff_mean = (
+                    float(np.mean(amp_weight_eff_hist[-2000:])) if amp_weight_eff_hist else 0.0
+                )
                 amp_weighted_mean = (
                     float(np.mean(amp_weighted_reward_hist[-2000:])) if amp_weighted_reward_hist else 0.0
                 )
@@ -1209,7 +1234,7 @@ def train(args: argparse.Namespace) -> None:
                 )
                 if args.amp_enable:
                     msg += (
-                        f" amp_w={amp_weight_mean:.2f} amp_r={amp_reward_mean:.3f} "
+                        f" amp_w={amp_weight_mean:.2f} amp_w_eff={amp_weight_eff_mean:.2f} amp_r={amp_reward_mean:.3f} "
                         f"amp_w*r={amp_weighted_mean:.3f} task_w*r={task_weighted_mean:.3f} "
                         f"d_loss={amp_disc_loss:.4f} d_real={amp_d_real:.3f} d_fake={amp_d_fake:.3f}"
                     )
@@ -1239,6 +1264,7 @@ def train(args: argparse.Namespace) -> None:
                     algo_metrics["q2_mean"] = float(np.mean(q2_hist[-100:]))
                 if args.amp_enable:
                     algo_metrics["amp_weight_mean"] = amp_weight_mean
+                    algo_metrics["amp_weight_eff_mean"] = amp_weight_eff_mean
                     algo_metrics["amp_reward_mean"] = amp_reward_mean
                     algo_metrics["amp_weighted_reward_mean"] = amp_weighted_mean
                     algo_metrics["task_weighted_reward_mean"] = task_weighted_mean
