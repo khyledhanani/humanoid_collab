@@ -54,27 +54,27 @@ _HUG_STAGES = {
         w_dist=0.35,
         w_face=0.07,
         w_stab=0.1,
-        w_contact=3.2,
-        w_hand=1.0,
-        w_hand_back_contact=1.0,
+        w_contact=2.4,
+        w_hand=0.9,
+        w_hand_back_contact=1.8,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.007,
         w_fall=-25.0,
-        r_success=8000.0,
+        r_success=1200.0,
     ),
     3: dict(
         w_dist=0.25,
         w_face=0.06,
         w_stab=0.12,
-        w_contact=4.2,
-        w_hand=0.7,
-        w_hand_back_contact=1.4,
+        w_contact=3.0,
+        w_hand=0.6,
+        w_hand_back_contact=2.4,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.01,
         w_fall=-25.0,
-        r_success=1000.0,
+        r_success=1800.0,
     ),
 }
 
@@ -235,10 +235,10 @@ class HugTask(TaskConfig):
         # Relaxed chest-distance windows for fixed-standing (roots are pinned).
         if self._fixed_standing:
             by_stage = {
-                0: dict(dist_min=0.12, dist_max=0.90, hand_mean_max=0.42, hand_max_max=0.46, need_contact=False, need_dual_contact=False, need_wrap=False),
-                1: dict(dist_min=0.12, dist_max=0.86, hand_mean_max=0.50, hand_max_max=0.46, need_contact=True, need_dual_contact=False, need_wrap=False),
-                2: dict(dist_min=0.12, dist_max=0.80, hand_mean_max=0.48, hand_max_max=0.42, need_contact=True, need_dual_contact=True, need_wrap=False),
-                3: dict(dist_min=0.12, dist_max=0.74, hand_mean_max=0.42, hand_max_max=0.38, need_contact=True, need_dual_contact=True, need_wrap=True),
+                0: dict(dist_min=0.12, dist_max=0.80, hand_mean_max=0.40, hand_max_max=0.44, need_contact=True, need_dual_contact=False, need_wrap=False),
+                1: dict(dist_min=0.12, dist_max=0.78, hand_mean_max=0.46, hand_max_max=0.44, need_contact=True, need_dual_contact=True, need_wrap=False),
+                2: dict(dist_min=0.12, dist_max=0.74, hand_mean_max=0.44, hand_max_max=0.40, need_contact=True, need_dual_contact=True, need_wrap=False),
+                3: dict(dist_min=0.12, dist_max=0.70, hand_mean_max=0.40, hand_max_max=0.36, need_contact=True, need_dual_contact=True, need_wrap=True),
             }
         else:
             by_stage = {
