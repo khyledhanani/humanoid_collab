@@ -36,12 +36,18 @@ class TestHugTask:
             config.set_stage(stage)
             weights = config.get_weights_dict()
             assert isinstance(weights, dict)
+        config.set_stage(0)
+        s0 = config.get_weights_dict().get("w_hand_back_contact", 0.0)
         config.set_stage(1)
-        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) == 0.0
+        s1 = config.get_weights_dict().get("w_hand_back_contact", 0.0)
         config.set_stage(2)
-        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) > 0.0
+        s2 = config.get_weights_dict().get("w_hand_back_contact", 0.0)
         config.set_stage(3)
-        assert config.get_weights_dict().get("w_hand_back_contact", 0.0) > 0.0
+        s3 = config.get_weights_dict().get("w_hand_back_contact", 0.0)
+        assert s0 > 0.0
+        assert s1 > s0
+        assert s2 > s1
+        assert s3 > s2
 
     def test_hug_reward_computation(self):
         env = HumanoidCollabEnv(task="hug")

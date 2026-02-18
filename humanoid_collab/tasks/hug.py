@@ -19,10 +19,10 @@ from humanoid_collab.constants import DEFAULT_ROOT_Z
 
 # Curriculum weights per stage.
 # Hug curriculum for fixed-standing:
-#   stage 0: hand placement and pose organization
-#   stage 1: add initial contact requirement
-#   stage 2: require bilateral contact quality + hand-on-back contact bonus
-#   stage 3: tighten hold quality / wrap quality + stronger hand-on-back bonus
+#   stage 0: hand placement and pose organization + light hand-on-back bias
+#   stage 1: add initial contact requirements + stronger hand-on-back emphasis
+#   stage 2: require bilateral contact quality + strong hand-on-back contact bonus
+#   stage 3: tighten hold quality / wrap quality + strongest hand-on-back bonus
 _HUG_STAGES = {
     0: dict(
         w_dist=0.45,
@@ -30,7 +30,7 @@ _HUG_STAGES = {
         w_stab=0.05,
         w_contact=1.0,
         w_hand=1.3,
-        w_hand_back_contact=0.0,
+        w_hand_back_contact=0.35,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.005,
@@ -43,7 +43,7 @@ _HUG_STAGES = {
         w_stab=0.08,
         w_contact=2.0,
         w_hand=1.2,
-        w_hand_back_contact=0.0,
+        w_hand_back_contact=0.9,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.005,
@@ -56,7 +56,7 @@ _HUG_STAGES = {
         w_stab=0.1,
         w_contact=2.4,
         w_hand=0.9,
-        w_hand_back_contact=1.8,
+        w_hand_back_contact=2.2,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.007,
@@ -69,7 +69,7 @@ _HUG_STAGES = {
         w_stab=0.12,
         w_contact=3.0,
         w_hand=0.6,
-        w_hand_back_contact=2.4,
+        w_hand_back_contact=3.0,
         w_time=-0.02,
         w_energy=-0.001,
         w_impact=-0.01,
