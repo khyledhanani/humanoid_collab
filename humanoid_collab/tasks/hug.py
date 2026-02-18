@@ -28,6 +28,7 @@ _HUG_STAGES = {
         w_dist=0.45,
         w_face=0.08,
         w_stab=0.05,
+        w_upright=0.5,
         w_contact=1.0,
         w_hand=1.3,
         w_hand_back_contact=0.35,
@@ -41,6 +42,7 @@ _HUG_STAGES = {
         w_dist=0.4,
         w_face=0.08,
         w_stab=0.08,
+        w_upright=0.7,
         w_contact=2.0,
         w_hand=1.2,
         w_hand_back_contact=0.9,
@@ -54,6 +56,7 @@ _HUG_STAGES = {
         w_dist=0.35,
         w_face=0.07,
         w_stab=0.1,
+        w_upright=0.9,
         w_contact=2.4,
         w_hand=0.9,
         w_hand_back_contact=2.2,
@@ -67,6 +70,7 @@ _HUG_STAGES = {
         w_dist=0.25,
         w_face=0.06,
         w_stab=0.12,
+        w_upright=1.1,
         w_contact=3.0,
         w_hand=0.6,
         w_hand_back_contact=3.0,
@@ -84,6 +88,8 @@ FACING_THRESH_FINAL = 0.60
 V_THRESH_BASE = 1.20
 V_THRESH_FINAL = 0.90
 TILT_THRESH = 0.5
+TILT_THRESH_FIXED = 0.42
+UPRIGHT_SOFT_TILT = 0.28
 HAND_ALPHA = 4.0
 BETA_SPEED = 2.0
 HAND_BACKSIDE_X_MAX = -0.01
@@ -470,6 +476,23 @@ class HugTask(TaskConfig):
         info["hand_back_contact_ratio"] = hand_back_contact_ratio
         info["r_hand_back_contact"] = r_hand_back_contact
 
+        # Per-step anti-slouch shaping so policies do not farm rewards while folded over.
+        h0_tilt = compute_tilt_angle(get_up_vector(h0_xmat))
+        h1_tilt = compute_tilt_angle(get_up_vector(h1_xmat))
+        tilt_soft = UPRIGHT_SOFT_TILT
+        h0_tilt_excess = max(0.0, h0_tilt - tilt_soft)
+        h1_tilt_excess = max(0.0, h1_tilt - tilt_soft)
+        r_upright = -float(w.get("w_upright", 0.0)) * (
+            h0_tilt_excess * h0_tilt_excess + h1_tilt_excess * h1_tilt_excess
+        )
+        total += r_upright
+        info["h0_tilt"] = h0_tilt
+        info["h1_tilt"] = h1_tilt
+        info["upright_soft_tilt"] = tilt_soft
+        info["h0_tilt_excess"] = h0_tilt_excess
+        info["h1_tilt_excess"] = h1_tilt_excess
+        info["r_upright"] = r_upright
+
         # Time pressure to prefer completing the task quickly over farming shaping.
         r_time = float(w.get("w_time", 0.0))
         total += r_time
@@ -540,7 +563,9 @@ class HugTask(TaskConfig):
 
         h0_tilt = compute_tilt_angle(get_up_vector(h0_xmat))
         h1_tilt = compute_tilt_angle(get_up_vector(h1_xmat))
-        upright_ok = h0_tilt < TILT_THRESH and h1_tilt < TILT_THRESH
+        upright_thresh = TILT_THRESH_FIXED if self._fixed_standing else TILT_THRESH
+        upright_ok = h0_tilt < upright_thresh and h1_tilt < upright_thresh
+        info["hug_upright_thresh"] = upright_thresh
         info["hug_upright_ok"] = upright_ok
 
         hand_d = self._compute_hand_back_distances(data, id_cache)
