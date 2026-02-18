@@ -569,8 +569,7 @@ class HumanoidCollabEnv(ParallelEnv):
         if self.task_name == "handshake":
             return 0.4, True
         if self.task_name == "hug":
-            # Start slightly closer so fixed-standing policies can reach wrap/contact early.
-            return 0.15, True
+            return 0.22, True
         return 0.9, True
 
     def _build_control_actuator_indices(self) -> Dict[str, np.ndarray]:

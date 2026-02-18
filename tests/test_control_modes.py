@@ -60,9 +60,10 @@ def test_handshake_fixed_standing_spawn_is_reachable():
         env.close()
 
 
-def test_hug_fixed_standing_spawn_is_reachable():
+def test_hug_fixed_standing_spawn_is_reachable_early_stage():
     env = HumanoidCollabEnv(
         task="hug",
+        stage=0,
         fixed_standing=True,
         control_mode="arms_only",
     )
@@ -73,7 +74,27 @@ def test_hug_fixed_standing_spawn_is_reachable():
         h0_x = float(env.data.qpos[h0_qpos[0]])
         h1_x = float(env.data.qpos[h1_qpos[0]])
         dist = abs(h1_x - h0_x)
-        # Hug fixed-standing should start close enough for arm wrap behaviors.
+        # Early fixed-standing hug stages should leave extra space to avoid foot overlap.
+        assert 0.35 <= dist <= 0.55
+    finally:
+        env.close()
+
+
+def test_hug_fixed_standing_spawn_is_reachable_late_stage():
+    env = HumanoidCollabEnv(
+        task="hug",
+        stage=3,
+        fixed_standing=True,
+        control_mode="arms_only",
+    )
+    try:
+        env.reset(seed=42)
+        h0_qpos = env.id_cache.joint_qpos_idx["h0"]
+        h1_qpos = env.id_cache.joint_qpos_idx["h1"]
+        h0_x = float(env.data.qpos[h0_qpos[0]])
+        h1_x = float(env.data.qpos[h1_qpos[0]])
+        dist = abs(h1_x - h0_x)
+        # Later stages should spawn closer so wrap/contact rewards are reachable.
         assert 0.15 <= dist <= 0.35
     finally:
         env.close()
