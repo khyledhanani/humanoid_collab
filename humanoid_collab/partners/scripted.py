@@ -98,6 +98,15 @@ class ScriptedPartner:
         chest_active  = self.id_cache.get_site_xpos(data, f"{self.active_agent}_chest")
         chest_partner = self.id_cache.get_site_xpos(data, f"{self.partner_agent}_chest")
         dist = float(np.linalg.norm(chest_active - chest_partner))
+        return self.get_action_from_distance(dist)
+
+    def get_action_from_distance(self, chest_distance: float) -> np.ndarray:
+        """Compute action from chest distance only.
+
+        This is useful for vectorized subprocess training where callers do not
+        have direct access to per-env MuJoCo `data` objects.
+        """
+        dist = float(chest_distance)
 
         # Select target pose
         if dist <= self.embrace_thresh:

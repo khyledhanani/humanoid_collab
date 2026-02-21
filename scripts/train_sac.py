@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -47,6 +47,10 @@ from humanoid_collab import HumanoidCollabEnv
 from humanoid_collab.mjcf_builder import available_physics_profiles
 from humanoid_collab.partners.scripted import ScriptedPartner
 from humanoid_collab.utils.exp_logging import ExperimentLogger
+from humanoid_collab.vector_env import (
+    SharedMemHumanoidCollabVecEnv,
+    SubprocHumanoidCollabVecEnv,
+)
 
 # ---------------------------------------------------------------------------
 # Stage-conditioned target entropy
@@ -79,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--horizon", type=int, default=500)
     p.add_argument("--frame-skip", type=int, default=5)
     p.add_argument("--hold-target", type=int, default=30)
+    p.add_argument("--num-envs", type=int, default=1)
+    p.add_argument(
+        "--vec-env-backend",
+        type=str,
+        default="shared_memory",
+        choices=["shared_memory", "subproc"],
+        help="Vector env backend used when --num-envs > 1.",
+    )
+    p.add_argument("--start-method", type=str, default=None)
 
     # H1 / partner configuration
     p.add_argument(
@@ -371,6 +384,85 @@ def _mean_recent(values: List[float], n: int) -> float:
     return float(np.mean(values[-k:]))
 
 
+def _make_env_kwargs(args: argparse.Namespace, stage: int) -> Dict[str, object]:
+    return dict(
+        task=args.task,
+        horizon=args.horizon,
+        frame_skip=args.frame_skip,
+        hold_target=args.hold_target,
+        stage=int(stage),
+        physics_profile=args.physics_profile,
+        fixed_standing=False,
+        control_mode="all",
+        weld_h1_only=True,
+        h1_weld_mode=args.h1_weld_mode,
+    )
+
+
+def _format_reset_obs(obs: Dict[str, np.ndarray], num_envs: int) -> Dict[str, np.ndarray]:
+    if num_envs == 1:
+        return {
+            "h0": np.asarray(obs["h0"], dtype=np.float32)[None, ...],
+            "h1": np.asarray(obs["h1"], dtype=np.float32)[None, ...],
+        }
+    return {
+        "h0": np.asarray(obs["h0"], dtype=np.float32),
+        "h1": np.asarray(obs["h1"], dtype=np.float32),
+    }
+
+
+def _build_env(args: argparse.Namespace, stage: int, seed: Optional[int]):
+    env_kwargs = _make_env_kwargs(args, stage)
+    if args.num_envs == 1:
+        env = HumanoidCollabEnv(**env_kwargs)
+        obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
+    else:
+        if args.vec_env_backend == "shared_memory":
+            env = SharedMemHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
+        else:
+            env = SubprocHumanoidCollabVecEnv(
+                num_envs=args.num_envs,
+                env_kwargs=env_kwargs,
+                auto_reset=True,
+                start_method=args.start_method,
+            )
+        obs, infos = env.reset(seed=seed, options={"stage": int(stage)})
+    return env, _format_reset_obs(obs, args.num_envs), infos
+
+
+def _normalize_infos_payload(
+    infos_payload: Any, num_envs: int
+) -> List[Dict[str, Dict[str, Any]]]:
+    if num_envs == 1 and isinstance(infos_payload, dict):
+        return [infos_payload]
+    if not isinstance(infos_payload, list):
+        raise TypeError(
+            f"Expected list infos payload for num_envs={num_envs}, got {type(infos_payload)}"
+        )
+    return infos_payload
+
+
+def _maybe_replace_final_obs_from_infos(
+    next_obs_batch: np.ndarray,
+    done_mask: np.ndarray,
+    infos: List[Dict[str, Dict[str, Any]]],
+) -> np.ndarray:
+    out = np.asarray(next_obs_batch, dtype=np.float32).copy()
+    for env_idx, done in enumerate(done_mask):
+        if not bool(done):
+            continue
+        info_env = infos[env_idx] if env_idx < len(infos) else {}
+        final_obs = info_env.get("h0", {}).get("final_observation")
+        if final_obs is not None:
+            out[env_idx] = np.asarray(final_obs, dtype=np.float32)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
@@ -432,6 +524,8 @@ def _load_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be > 0")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -440,244 +534,354 @@ def main() -> None:
 
     device = _resolve_device(args.device)
     os.makedirs(args.save_dir, exist_ok=True)
-
-    # ---- Environment ----
-    # H1 is always welded in Stage A/B.  H1 weld mode selects torso (Stage A)
-    # or lower_body (Stage B, arms free for scripted controller).
-    env = HumanoidCollabEnv(
-        task=args.task,
-        horizon=args.horizon,
-        frame_skip=args.frame_skip,
-        hold_target=args.hold_target,
-        stage=args.stage,
-        physics_profile=args.physics_profile,
-        fixed_standing=False,
-        control_mode="all",
-        weld_h1_only=True,
-        h1_weld_mode=args.h1_weld_mode,
-    )
-
-    obs_dim = env.observation_space("h0").shape[0]
-    act_dim = env.action_space("h0").shape[0]
-    stage   = args.stage
-    ent     = _target_entropy(stage, args.target_entropy_override, act_dim)
+    stage = int(args.stage)
+    env, obs_dict, _ = _build_env(args, stage=stage, seed=args.seed)
+    obs_h0 = np.asarray(obs_dict["h0"], dtype=np.float32)
+    num_envs = int(obs_h0.shape[0])
+    obs_dim = int(obs_h0.shape[-1])
+    act_dim = int(env.action_space("h0").shape[0])
+    ent = _target_entropy(stage, args.target_entropy_override, act_dim)
 
     print(
         f"[train_sac] obs_dim={obs_dim}  act_dim={act_dim}  "
+        f"num_envs={num_envs}  vec_backend={args.vec_env_backend}  "
         f"device={device}  partner_mode={args.partner_mode}  "
         f"h1_weld_mode={args.h1_weld_mode}"
     )
 
-    # ---- Scripted partner (Stage B only) ----
-    scripted_partner: Optional[ScriptedPartner] = None
-    if args.partner_mode == "scripted":
-        arm_positions = _build_arm_actuator_positions(env, partner="h1")
-        scripted_partner = ScriptedPartner(
-            id_cache=env.id_cache,
-            arm_actuator_positions=arm_positions,
-            act_dim=act_dim,
-        )
-        print(f"[train_sac] Scripted partner arm positions: {arm_positions}")
+    meta_env: Optional[HumanoidCollabEnv] = None
+    scripted_partners: Optional[List[ScriptedPartner]] = None
+    chest_dist_obs_idx: Optional[int] = None
+    logger: Optional[ExperimentLogger] = None
 
-    # ---- Networks ----
-    actor         = SACGaussianActor(obs_dim, act_dim, args.hidden_size).to(device)
-    critic        = SACTwinCritic(obs_dim, act_dim, args.hidden_size).to(device)
-    critic_target = SACTwinCritic(obs_dim, act_dim, args.hidden_size).to(device)
-    critic_target.load_state_dict(critic.state_dict())
-    for p in critic_target.parameters():
-        p.requires_grad = False
-
-    actor_opt  = optim.Adam(actor.parameters(),  lr=args.actor_lr)
-    critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)
-    log_alpha  = torch.tensor(0.0, requires_grad=True, device=device)
-    alpha_opt  = optim.Adam([log_alpha], lr=args.alpha_lr)
-
-    replay = SACReplayBuffer(args.buffer_size, obs_dim, act_dim)
-
-    # ---- Resume ----
-    global_step = 0
-    if args.resume_from and os.path.isfile(args.resume_from):
-        global_step, stage = _load_checkpoint(
-            args.resume_from,
-            actor, critic, critic_target,
-            actor_opt, critic_opt, alpha_opt, log_alpha,
-            device,
-        )
-        ent = _target_entropy(stage, args.target_entropy_override, act_dim)
-        env.reset(options={"stage": stage})
-        print(
-            f"[train_sac] Resumed from {args.resume_from} "
-            f"at step={global_step}, stage={stage}"
-        )
-
-    # ---- Logger ----
-    logger = ExperimentLogger.create(
-        enabled=not args.no_wandb,
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        run_name=args.wandb_run_name,
-        group=args.wandb_group,
-        tags=args.wandb_tags,
-        mode=args.wandb_mode,
-        run_dir=args.log_dir,
-        config=vars(args),
-    )
-
-    # ---- Curriculum / episode tracking ----
-    ep_success_hist: List[float] = []
-    ep_reward_hist:  List[float] = []
-    ep_hold_hist:    List[int]   = []
-    ep_steps_in_stage = 0
-    n_episodes = 0
-    last_metrics: Dict[str, float] = {}
-
-    # ---- Reset ----
-    obs_dict, _ = env.reset()
-    obs_h0  = obs_dict["h0"]
-    ep_reward   = 0.0
-    ep_max_hold = 0
-
-    if scripted_partner is not None:
-        scripted_partner.reset()
-
-    t0         = time.time()
-    print_step = 0
-
-    # ---- Main loop ----
-    for _ in range(args.total_steps):
-        global_step += 1
-
-        # Action: random during warm-up, SAC thereafter
-        if global_step < args.start_steps:
-            action_h0 = env.action_space("h0").sample()
+    try:
+        if isinstance(env, HumanoidCollabEnv):
+            meta_env = env
         else:
-            obs_t = torch.as_tensor(obs_h0[None], dtype=torch.float32, device=device)
-            action_h0 = actor.get_action(obs_t)[0]
+            meta_env = HumanoidCollabEnv(**_make_env_kwargs(args, stage))
 
-        # H1 action: zero (Stage A) or scripted (Stage B)
-        if scripted_partner is not None:
-            action_h1 = scripted_partner.get_action(env.data)
-        else:
-            action_h1 = np.zeros(act_dim, dtype=np.float32)
+        # ---- Scripted partner (Stage B only) ----
+        if args.partner_mode == "scripted":
+            if args.task != "hug":
+                raise ValueError("--partner-mode scripted currently supports only --task hug.")
+            arm_positions = _build_arm_actuator_positions(meta_env, partner="h1")
+            scripted_partners = [
+                ScriptedPartner(
+                    id_cache=meta_env.id_cache,
+                    arm_actuator_positions=arm_positions,
+                    act_dim=act_dim,
+                )
+                for _ in range(num_envs)
+            ]
+            task_obs_dim = int(meta_env.task_config.task_obs_dim)
+            base_obs_dim = int(meta_env.obs_builder.get_base_obs_dim())
+            if task_obs_dim < 11:
+                raise ValueError(
+                    "Scripted partner expects hug task observation with chest distance."
+                )
+            chest_dist_obs_idx = base_obs_dim + 10
+            print(
+                f"[train_sac] Scripted partner arm positions: {arm_positions} "
+                f"(chest_dist_obs_idx={chest_dist_obs_idx})"
+            )
 
-        obs_new, rew_dict, term_dict, trunc_dict, info_dict = env.step(
-            {"h0": action_h0, "h1": action_h1}
+        # ---- Networks ----
+        actor = SACGaussianActor(obs_dim, act_dim, args.hidden_size).to(device)
+        critic = SACTwinCritic(obs_dim, act_dim, args.hidden_size).to(device)
+        critic_target = SACTwinCritic(obs_dim, act_dim, args.hidden_size).to(device)
+        critic_target.load_state_dict(critic.state_dict())
+        for p in critic_target.parameters():
+            p.requires_grad = False
+
+        actor_opt = optim.Adam(actor.parameters(), lr=args.actor_lr)
+        critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)
+        log_alpha = torch.tensor(0.0, requires_grad=True, device=device)
+        alpha_opt = optim.Adam([log_alpha], lr=args.alpha_lr)
+        replay = SACReplayBuffer(args.buffer_size, obs_dim, act_dim)
+
+        # ---- Resume ----
+        global_step = 0
+        if args.resume_from:
+            if not os.path.isfile(args.resume_from):
+                raise FileNotFoundError(
+                    f"--resume-from checkpoint not found: {args.resume_from}"
+                )
+            global_step, stage = _load_checkpoint(
+                args.resume_from,
+                actor,
+                critic,
+                critic_target,
+                actor_opt,
+                critic_opt,
+                alpha_opt,
+                log_alpha,
+                device,
+            )
+            ent = _target_entropy(stage, args.target_entropy_override, act_dim)
+            obs_dict, _ = env.reset(seed=None, options={"stage": int(stage)})
+            obs_h0 = np.asarray(obs_dict["h0"], dtype=np.float32)
+            print(
+                f"[train_sac] Resumed from {args.resume_from} "
+                f"at step={global_step}, stage={stage}"
+            )
+
+        # ---- Logger ----
+        logger = ExperimentLogger.create(
+            enabled=not args.no_wandb,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            run_name=args.wandb_run_name,
+            group=args.wandb_group,
+            tags=args.wandb_tags,
+            mode=args.wandb_mode,
+            run_dir=args.log_dir,
+            config=vars(args),
         )
 
-        next_obs_h0 = obs_new["h0"]
-        reward      = float(rew_dict["h0"])
-        terminated  = bool(term_dict["h0"])
-        truncated   = bool(trunc_dict["h0"])
-        done        = terminated or truncated
+        # ---- Curriculum / episode tracking ----
+        ep_success_hist: List[float] = []
+        ep_reward_hist: List[float] = []
+        ep_hold_hist: List[int] = []
+        ep_steps_in_stage = 0
+        n_episodes = 0
+        last_metrics: Dict[str, float] = {}
 
-        # Store transition.  Use terminated (not truncated) as the done signal
-        # so the value bootstrap is not cut on timeout.
-        replay.add(obs_h0, action_h0, reward, next_obs_h0, float(terminated))
+        ep_reward = np.zeros((num_envs,), dtype=np.float32)
+        ep_max_hold = np.zeros((num_envs,), dtype=np.int32)
+        collector_steps = 0
 
-        obs_h0       = next_obs_h0
-        ep_reward   += reward
-        ep_max_hold  = max(ep_max_hold, info_dict["h0"].get("hold_steps", 0))
+        if scripted_partners is not None:
+            for partner in scripted_partners:
+                partner.reset()
 
-        # ---- SAC update ----
-        if (
-            global_step >= args.update_after
-            and len(replay) >= args.batch_size
-            and global_step % args.update_every == 0
-        ):
-            for _ in range(args.gradient_steps):
-                batch = replay.sample(args.batch_size, device)
-                last_metrics = sac_update(
-                    actor, critic, critic_target,
-                    actor_opt, critic_opt, alpha_opt,
-                    log_alpha, ent,
-                    batch, args.gamma, args.tau, args.max_grad_norm,
+        t0 = time.time()
+        print_step = global_step
+        last_save_step = global_step
+
+        # ---- Main loop ----
+        while global_step < args.total_steps:
+            # Action: random during warm-up, SAC thereafter
+            if global_step < args.start_steps:
+                action_h0 = np.random.uniform(
+                    -1.0, 1.0, size=(num_envs, act_dim)
+                ).astype(np.float32)
+            else:
+                obs_t = torch.as_tensor(obs_h0, dtype=torch.float32, device=device)
+                action_h0 = actor.get_action(obs_t).astype(np.float32)
+
+            # H1 action: zero (Stage A) or scripted (Stage B).
+            if scripted_partners is not None:
+                if chest_dist_obs_idx is None:
+                    raise RuntimeError("Scripted partner is enabled but chest distance index is unset.")
+                chest_dist = np.asarray(obs_h0[:, chest_dist_obs_idx], dtype=np.float32)
+                action_h1 = np.zeros((num_envs, act_dim), dtype=np.float32)
+                for env_idx, partner in enumerate(scripted_partners):
+                    action_h1[env_idx] = partner.get_action_from_distance(
+                        float(chest_dist[env_idx])
+                    )
+            else:
+                action_h1 = np.zeros((num_envs, act_dim), dtype=np.float32)
+
+            if num_envs == 1:
+                obs_new, rew_dict, term_dict, trunc_dict, info_dict = env.step(
+                    {"h0": action_h0[0], "h1": action_h1[0]}
+                )
+                infos_list = [info_dict]
+                reward_batch = np.asarray([float(rew_dict["h0"])], dtype=np.float32)
+                term_batch = np.asarray([bool(term_dict["h0"])], dtype=np.bool_)
+                trunc_batch = np.asarray([bool(trunc_dict["h0"])], dtype=np.bool_)
+                done_mask = np.logical_or(term_batch, trunc_batch)
+
+                next_obs_rollout = np.asarray(obs_new["h0"], dtype=np.float32)[None, ...]
+                next_obs_buffer = next_obs_rollout
+
+                reason = str(info_dict.get("h0", {}).get("termination_reason", "running"))
+                if bool(done_mask[0]) and reason == "running":
+                    reason = "termination" if bool(term_batch[0]) else "truncation"
+                reasons = [reason]
+
+                if bool(done_mask[0]):
+                    reset_obs, _ = env.reset(seed=None, options={"stage": int(stage)})
+                    next_obs_rollout = np.asarray(reset_obs["h0"], dtype=np.float32)[None, ...]
+            else:
+                obs_new, rew_dict, term_dict, trunc_dict, infos_payload = env.step(
+                    {"h0": action_h0, "h1": action_h1}
+                )
+                infos_list = _normalize_infos_payload(infos_payload, num_envs)
+                reward_batch = np.asarray(rew_dict["h0"], dtype=np.float32)
+                term_batch = np.asarray(term_dict["h0"], dtype=np.bool_)
+                trunc_batch = np.asarray(trunc_dict["h0"], dtype=np.bool_)
+                done_mask = np.logical_or(term_batch, trunc_batch)
+
+                next_obs_rollout = np.asarray(obs_new["h0"], dtype=np.float32)
+                next_obs_buffer = _maybe_replace_final_obs_from_infos(
+                    next_obs_batch=next_obs_rollout,
+                    done_mask=done_mask,
+                    infos=infos_list,
                 )
 
-        # ---- Episode end ----
-        if done:
-            reason  = info_dict["h0"].get("termination_reason", "unknown")
-            success = reason == "success"
+                reasons = []
+                for env_idx in range(num_envs):
+                    info_env = infos_list[env_idx] if env_idx < len(infos_list) else {}
+                    reason = str(info_env.get("h0", {}).get("termination_reason", "running"))
+                    if bool(done_mask[env_idx]) and reason == "running":
+                        reason = "termination" if bool(term_batch[env_idx]) else "truncation"
+                    reasons.append(reason)
 
-            ep_success_hist.append(float(success))
-            ep_reward_hist.append(ep_reward)
-            ep_hold_hist.append(ep_max_hold)
-            ep_steps_in_stage += 1
-            n_episodes += 1
+            # Store transition.  Use terminated (not truncated) as the done signal
+            # so the value bootstrap is not cut on timeout.
+            for env_idx in range(num_envs):
+                replay.add(
+                    obs_h0[env_idx],
+                    action_h0[env_idx],
+                    float(reward_batch[env_idx]),
+                    next_obs_buffer[env_idx],
+                    float(term_batch[env_idx]),
+                )
+
+            obs_h0 = next_obs_rollout
+            ep_reward += reward_batch
+            for env_idx in range(num_envs):
+                h0_info = infos_list[env_idx].get("h0", {})
+                ep_max_hold[env_idx] = max(
+                    int(ep_max_hold[env_idx]), int(h0_info.get("hold_steps", 0))
+                )
+
+            global_step += num_envs
+            collector_steps += 1
+
+            # ---- SAC update ----
+            if (
+                global_step >= args.update_after
+                and len(replay) >= args.batch_size
+                and collector_steps % args.update_every == 0
+            ):
+                for _ in range(args.gradient_steps):
+                    batch = replay.sample(args.batch_size, device)
+                    last_metrics = sac_update(
+                        actor,
+                        critic,
+                        critic_target,
+                        actor_opt,
+                        critic_opt,
+                        alpha_opt,
+                        log_alpha,
+                        ent,
+                        batch,
+                        args.gamma,
+                        args.tau,
+                        args.max_grad_norm,
+                    )
+
+            # ---- Episode end ----
+            for env_idx, done in enumerate(done_mask):
+                if not bool(done):
+                    continue
+                reason = reasons[env_idx]
+                success = reason == "success"
+
+                ep_success_hist.append(float(success))
+                ep_reward_hist.append(float(ep_reward[env_idx]))
+                ep_hold_hist.append(int(ep_max_hold[env_idx]))
+                ep_steps_in_stage += 1
+                n_episodes += 1
+
+                logger.log(
+                    step=global_step,
+                    common={
+                        "episode_reward": float(ep_reward[env_idx]),
+                        "success": float(success),
+                        "max_hold_steps": int(ep_max_hold[env_idx]),
+                        "stage": stage,
+                        "n_episodes": n_episodes,
+                    },
+                    algo=last_metrics or {},
+                )
+
+                ep_reward[env_idx] = 0.0
+                ep_max_hold[env_idx] = 0
+                if scripted_partners is not None:
+                    scripted_partners[env_idx].reset()
 
             # Auto-curriculum
-            if args.auto_curriculum and stage < 3:
-                if ep_steps_in_stage >= args.curriculum_min_episodes:
-                    sr = _mean_recent(ep_success_hist, args.curriculum_window)
-                    if sr >= args.curriculum_threshold:
-                        stage += 1
-                        env.reset(options={"stage": stage})
-                        ent = _target_entropy(stage, args.target_entropy_override, act_dim)
-                        ep_steps_in_stage = 0
-                        print(
-                            f"\n[Curriculum] Advanced to stage {stage}  "
-                            f"(success_rate={sr:.2f}  step={global_step})\n"
-                        )
+            if (
+                args.auto_curriculum
+                and stage < 3
+                and ep_steps_in_stage >= args.curriculum_min_episodes
+            ):
+                sr = _mean_recent(ep_success_hist, args.curriculum_window)
+                if sr >= args.curriculum_threshold:
+                    stage += 1
+                    ent = _target_entropy(stage, args.target_entropy_override, act_dim)
+                    ep_steps_in_stage = 0
+                    obs_dict, _ = env.reset(seed=None, options={"stage": int(stage)})
+                    obs_h0 = np.asarray(obs_dict["h0"], dtype=np.float32)
+                    ep_reward.fill(0.0)
+                    ep_max_hold.fill(0)
+                    if scripted_partners is not None:
+                        for partner in scripted_partners:
+                            partner.reset()
+                    print(
+                        f"\n[Curriculum] Advanced to stage {stage}  "
+                        f"(success_rate={sr:.2f}  step={global_step})\n"
+                    )
 
-            logger.log(
-                step=global_step,
-                common={
-                    "episode_reward":  ep_reward,
-                    "success":         float(success),
-                    "max_hold_steps":  ep_max_hold,
-                    "stage":           stage,
-                    "n_episodes":      n_episodes,
-                },
-                algo=last_metrics or {},
-            )
+            # ---- Periodic console log ----
+            if global_step - print_step >= args.print_every_steps:
+                print_step = global_step
+                elapsed = time.time() - t0
+                sps = global_step / max(elapsed, 1e-3)
+                sr = _mean_recent(ep_success_hist, args.curriculum_window)
+                mean_r = _mean_recent(ep_reward_hist, 20)
+                mean_hold = _mean_recent([float(h) for h in ep_hold_hist], 20)
+                alpha_val = log_alpha.exp().item()
+                q_mean = last_metrics.get("q_mean", float("nan"))
+                print(
+                    f"step={global_step:>9,d}  stage={stage}  sps={sps:,.0f}  "
+                    f"ep={n_episodes:,d}  sr={sr:.3f}  "
+                    f"mean_r={mean_r:.2f}  hold={mean_hold:.1f}  "
+                    f"alpha={alpha_val:.4f}  q={q_mean:.3f}"
+                )
 
-            obs_dict, _ = env.reset()
-            obs_h0      = obs_dict["h0"]
-            ep_reward   = 0.0
-            ep_max_hold = 0
+            # ---- Checkpoint ----
+            if global_step - last_save_step >= args.save_every_steps:
+                ckpt_path = os.path.join(args.save_dir, f"step_{global_step:08d}.pt")
+                _save_checkpoint(
+                    ckpt_path,
+                    actor,
+                    critic,
+                    critic_target,
+                    actor_opt,
+                    critic_opt,
+                    alpha_opt,
+                    log_alpha,
+                    global_step,
+                    stage,
+                )
+                print(f"[ckpt] Saved {ckpt_path}")
+                last_save_step = global_step
 
-            if scripted_partner is not None:
-                scripted_partner.reset()
-
-        # ---- Periodic console log ----
-        if global_step - print_step >= args.print_every_steps:
-            print_step = global_step
-            elapsed    = time.time() - t0
-            sps        = global_step / max(elapsed, 1e-3)
-            sr         = _mean_recent(ep_success_hist, args.curriculum_window)
-            mean_r     = _mean_recent(ep_reward_hist, 20)
-            mean_hold  = _mean_recent([float(h) for h in ep_hold_hist], 20)
-            alpha_val  = log_alpha.exp().item()
-            q_mean     = last_metrics.get("q_mean", float("nan"))
-            print(
-                f"step={global_step:>9,d}  stage={stage}  sps={sps:,.0f}  "
-                f"ep={n_episodes:,d}  sr={sr:.3f}  "
-                f"mean_r={mean_r:.2f}  hold={mean_hold:.1f}  "
-                f"alpha={alpha_val:.4f}  q={q_mean:.3f}"
-            )
-
-        # ---- Checkpoint ----
-        if global_step % args.save_every_steps == 0:
-            ckpt_path = os.path.join(args.save_dir, f"step_{global_step:08d}.pt")
-            _save_checkpoint(
-                ckpt_path,
-                actor, critic, critic_target,
-                actor_opt, critic_opt, alpha_opt, log_alpha,
-                global_step, stage,
-            )
-            print(f"[ckpt] Saved {ckpt_path}")
-
-    # ---- Final checkpoint ----
-    final_path = os.path.join(args.save_dir, "final.pt")
-    _save_checkpoint(
-        final_path,
-        actor, critic, critic_target,
-        actor_opt, critic_opt, alpha_opt, log_alpha,
-        global_step, stage,
-    )
-    print(f"\n[train_sac] Done. Final checkpoint: {final_path}")
-
-    env.close()
-    logger.finish()
+        # ---- Final checkpoint ----
+        final_path = os.path.join(args.save_dir, "final.pt")
+        _save_checkpoint(
+            final_path,
+            actor,
+            critic,
+            critic_target,
+            actor_opt,
+            critic_opt,
+            alpha_opt,
+            log_alpha,
+            global_step,
+            stage,
+        )
+        print(f"\n[train_sac] Done. Final checkpoint: {final_path}")
+    finally:
+        if meta_env is not None and meta_env is not env:
+            meta_env.close()
+        env.close()
+        if logger is not None:
+            logger.finish()
 
 
 if __name__ == "__main__":
