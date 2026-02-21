@@ -62,6 +62,8 @@ class HumanoidCollabEnv(ParallelEnv):
         obs_rgb_width: int = 84,
         obs_rgb_height: int = 84,
         emit_proprio_info: bool = False,
+        weld_h1_only: bool = False,
+        h1_weld_mode: str = "torso",
     ):
         super().__init__()
 
@@ -78,6 +80,13 @@ class HumanoidCollabEnv(ParallelEnv):
         self.obs_rgb_width = int(obs_rgb_width)
         self.obs_rgb_height = int(obs_rgb_height)
         self.emit_proprio_info = bool(emit_proprio_info)
+        self.weld_h1_only = bool(weld_h1_only)
+        self.h1_weld_mode = str(h1_weld_mode)
+        if self.h1_weld_mode not in {"torso", "lower_body"}:
+            raise ValueError(
+                f"Unknown h1_weld_mode '{self.h1_weld_mode}'. "
+                "Expected one of: torso, lower_body."
+            )
         if self.control_mode not in {"all", "arms_only"}:
             raise ValueError(
                 f"Unknown control_mode '{self.control_mode}'. "
@@ -108,6 +117,8 @@ class HumanoidCollabEnv(ParallelEnv):
             physics_profile=self.physics_profile,
             fixed_standing=self.fixed_standing,
             fixed_standing_mode=self._resolve_fixed_standing_mode(),
+            weld_h1_only=self.weld_h1_only,
+            h1_weld_mode=self.h1_weld_mode,
             spawn_half_distance=spawn_half_distance,
             h1_faces_h0=h1_faces_h0,
         )
@@ -563,6 +574,10 @@ class HumanoidCollabEnv(ParallelEnv):
 
     def _resolve_spawn_setup(self) -> Tuple[float, bool]:
         """Select initial spawn layout."""
+        if self.weld_h1_only:
+            # H1 is a static dummy; start them at locomotion distance, facing each other
+            # so H0 walks toward a humanoid it can actually hug.
+            return 1.0, True
         if not self.fixed_standing:
             return 1.0, False
         # For fixed-standing hand-only training, keep agents within reach and facing each other.

@@ -220,26 +220,29 @@ def _humanoid_actuators(prefix: str) -> str:
     <motor name="{prefix}_right_elbow" joint="{prefix}_right_elbow" gear="25" ctrlrange="-1 1"/>"""
 
 
-def _fixed_standing_equality(mode: str = "torso") -> str:
+def _fixed_standing_equality(
+    mode: str = "torso",
+    weld_agents: tuple = ("h0", "h1"),
+) -> str:
     """Constraint block for fixed-standing setups.
 
     Args:
         mode: "torso" to weld torso roots, "lower_body" to weld pelvis/lower-body
             segments while allowing torso articulation around abdomen joints.
+        weld_agents: Tuple of agent prefixes to weld.  Pass ("h1",) to weld only
+            the passive partner (Stage A / Stage B).
     """
-    if mode == "torso":
-        return """
-  <equality>
-    <weld body1="h0_torso" body2="world"/>
-    <weld body1="h1_torso" body2="world"/>
-  </equality>"""
-    if mode == "lower_body":
-        return """
-  <equality>
-    <weld body1="h0_lower_body" body2="world"/>
-    <weld body1="h1_lower_body" body2="world"/>
-  </equality>"""
-    raise ValueError(f"Unknown fixed_standing mode '{mode}'. Expected 'torso' or 'lower_body'.")
+    if not weld_agents:
+        return ""
+    valid_modes = {"torso", "lower_body"}
+    if mode not in valid_modes:
+        raise ValueError(f"Unknown fixed_standing mode '{mode}'. Expected one of: {valid_modes}.")
+    welds = []
+    for agent in weld_agents:
+        body = f"{agent}_torso" if mode == "torso" else f"{agent}_lower_body"
+        welds.append(f'    <weld body1="{body}" body2="world"/>')
+    weld_str = "\n".join(welds)
+    return f"\n  <equality>\n{weld_str}\n  </equality>"
 
 
 def build_mjcf(
@@ -248,6 +251,8 @@ def build_mjcf(
     physics_profile: str = "default",
     fixed_standing: bool = False,
     fixed_standing_mode: str = "torso",
+    weld_h1_only: bool = False,
+    h1_weld_mode: str = "torso",
     spawn_half_distance: float = 1.0,
     h1_faces_h0: bool = False,
 ) -> str:
@@ -261,6 +266,11 @@ def build_mjcf(
         fixed_standing_mode: Weld mode when fixed_standing=True:
             - "torso": weld each torso root to world
             - "lower_body": weld each lower body to world
+        weld_h1_only: If True, weld only H1 (passive dummy for Stage A / Stage B).
+            Takes precedence over fixed_standing when both are set.
+        h1_weld_mode: Weld mode for H1 when weld_h1_only=True:
+            - "torso": full weld (Stage A — completely inert dummy)
+            - "lower_body": weld pelvis only, arms free (Stage B — scripted arms)
         spawn_half_distance: Spawn offset magnitude from origin for each humanoid torso.
         h1_faces_h0: If True, initialize h1 facing opposite direction.
 
@@ -282,7 +292,13 @@ def build_mjcf(
     h1_body = _humanoid_body("h1", h1_pos, "h1_mat", quat=h1_quat)
     h0_actuators = _humanoid_actuators("h0")
     h1_actuators = _humanoid_actuators("h1")
-    equality_block = _fixed_standing_equality(fixed_standing_mode) if fixed_standing else ""
+
+    if weld_h1_only:
+        equality_block = _fixed_standing_equality(h1_weld_mode, weld_agents=("h1",))
+    elif fixed_standing:
+        equality_block = _fixed_standing_equality(fixed_standing_mode)
+    else:
+        equality_block = ""
 
     xml = f"""<mujoco model="humanoid_collab">
   <compiler angle="degree" inertiafromgeom="auto"/>
